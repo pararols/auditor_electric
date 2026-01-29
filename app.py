@@ -37,7 +37,8 @@ CUPS_MAPPING = {
     "ES0031408305363001CN0F": "Enll Rotonda crta",
     "ES0031408332025001ZK0F": "Polivalent",
     "ES0031408457126001XL0F": "Pavelló",
-    "ES0031408528667001SW0F": "Enll C/ nou"
+    "ES0031408528667001SW0F": "Enll C/ nou",
+    "ES0031406053346001CK0F": "Can Burcet"
 }
 
 # --- CSS Styling ---
@@ -98,7 +99,8 @@ def parse_data(uploaded_file):
                 
             # Apply Mapping for CUPS
             if h0 != 'Metadata':
-                h0 = CUPS_MAPPING.get(h0, "CAN BURCET")
+                # Use mapping if exists, otherwise keep original ID (Don't merge all into CAN BURCET)
+                h0 = CUPS_MAPPING.get(h0, h0)
             
             # Clean stripping level 1 and ensure string
             if pd.isna(h1):
@@ -573,26 +575,121 @@ def main():
                 else:
                     st.info("Selecciona rang i CUPS per visualitzar.")
                     
-                # 4. Comparative YoY (Annual)
-                st.subheader("Comparativa Anual (Total Seleccionat)")
+                # 4. Flexible Comparison Chart (Series)
+                st.subheader("Comparativa de Sèries (Tendències)")
                 
-                # We use the FULL DF for this, but filtered by Selected CUPS
-                if current_selection:
-                    # Aggregate selected cups full history
-                    total_ae_full, _ = get_aggregated_data(df, current_selection)
+                # Custom container for controls
+                col_sel, col_res = st.columns([4, 1])
+                
+                # Define Options
+                comp_options = ["TOTAL", "ENLLUMENAT (Agregat)", "EDIFICIS (Agregat)"] + sorted(all_cups)
+                
+                # Session state for this specific selector
+                if "comp_series_sel" not in st.session_state:
+                    st.session_state.comp_series_sel = ["TOTAL"]
                     
-                    # Resample Monthly
-                    monthly_data = total_ae_full.resample('ME').sum().reset_index()
-                    monthly_data.columns = ['Datetime', 'kWh']
-                    monthly_data['Year'] = monthly_data['Datetime'].dt.year
-                    monthly_data['Month'] = monthly_data['Datetime'].dt.month
-                    monthly_data['MonthName'] = monthly_data['Datetime'].dt.month_name()
+                # Reset Button logic
+                if col_res.button("Restablir (Total)", key="btn_reset_comp"):
+                    st.session_state.comp_series_sel = ["TOTAL"]
+                
+                # Multiselect
+                selection_series = col_sel.multiselect("Afegir/Treure Sèries al Gràfic", comp_options, key="series_multiselect", default=st.session_state.comp_series_sel)
+                
+                # Year Selector for Comparison
+                available_years = sorted(df.index.year.unique())
+                col_y_sel, _ = st.columns([2, 3])
+                selected_years_comp = col_y_sel.multiselect("Seleccionar Anys a Comparar", available_years, default=available_years, key="years_comp_sel")
+
+                # Plotting Logic
+                if selection_series:
+                    fig_comp = go.Figure()
                     
-                    fig_yoy = px.line(monthly_data, x='Month', y='kWh', color='Year', markers=True, 
-                                      title="Comparativa Interanual (Agregat Selecció)")
-                                      
-                    fig_yoy.update_layout(xaxis=dict(dtick=1, title="Mes"))
-                    st.plotly_chart(fig_yoy, use_container_width=True)
+                    # Logic: We want to compare across years based on the current View Mode.
+                    current_anchor = st.session_state.anchor_date
+                    
+                    if not selected_years_comp:
+                        st.warning("Selecciona almenys un any per comparar.")
+                    else:
+                        for item in selection_series:
+                            # 1. Get Series Data (Full History)
+                            if item == "TOTAL":
+                                s_full, _ = get_aggregated_data(df, all_cups)
+                            elif item == "ENLLUMENAT (Agregat)":
+                                s_full, _ = get_aggregated_data(df, lighting_cups)
+                            elif item == "EDIFICIS (Agregat)":
+                                s_full, _ = get_aggregated_data(df, building_cups)
+                            else:
+                                if item in all_cups:
+                                    cols = df[item].columns
+                                    ae_col = [c for c in cols if 'AE' in c and 'kWh' in c and 'AUTOCONS' not in c]
+                                    if ae_col:
+                                        s_full = df[item][ae_col[0]]
+                                    else:
+                                        continue
+                            
+                            # 2. Slice and Plot based on Mode
+                            if mode_t2 == 'Anual':
+                                # Resample to Monthly first
+                                s_monthly = s_full.resample('ME').sum()
+                                
+                                for y in selected_years_comp:
+                                    s_year = s_monthly[s_monthly.index.year == y]
+                                    if not s_year.empty:
+                                        x_vals = s_year.index.strftime('%b') 
+                                        fig_comp.add_trace(go.Scatter(
+                                            x=x_vals, y=s_year, name=f"{item} ({y})", mode='lines+markers',
+                                            hovertemplate="%{y:.2f} kWh<extra></extra>"
+                                        ))
+                                xaxis_args_comp = {'title': "Mes", 'dtick': 1}
+
+                            elif mode_t2 == 'Mensual':
+                                target_month = current_anchor.month
+                                target_month_name = current_anchor.strftime("%B")
+                                s_daily = s_full.resample('1d').sum()
+                                
+                                for y in selected_years_comp:
+                                    mask = (s_daily.index.year == y) & (s_daily.index.month == target_month)
+                                    s_sub = s_daily[mask]
+                                    if not s_sub.empty:
+                                        x_vals = s_sub.index.day
+                                        fig_comp.add_trace(go.Scatter(
+                                            x=x_vals, y=s_sub, name=f"{item} ({y})", mode='lines+markers'
+                                        ))
+                                xaxis_args_comp = {'title': f"Dia ({target_month_name})", 'dtick': 1}
+
+                            elif mode_t2 == 'Setmanal':
+                                target_week = current_anchor.isocalendar().week
+                                s_daily = s_full.resample('1d').sum()
+                                
+                                for y in selected_years_comp:
+                                    mask = (s_daily.index.isocalendar().week == target_week) & (s_daily.index.year == y)
+                                    s_sub = s_daily[mask]
+                                    if not s_sub.empty:
+                                        x_vals = s_sub.index.strftime('%a')
+                                        fig_comp.add_trace(go.Scatter(
+                                            x=x_vals, y=s_sub, name=f"{item} ({y})", mode='lines+markers'
+                                        ))
+                                xaxis_args_comp = {'title': f"Dia de la Setmana {target_week}", 'dtick': "M1"}
+
+                            elif mode_t2 == 'Diària':
+                                target_day = current_anchor.day
+                                target_month = current_anchor.month
+                                s_hourly = s_full
+                                
+                                for y in selected_years_comp:
+                                    mask = (s_hourly.index.year == y) & (s_hourly.index.month == target_month) & (s_hourly.index.day == target_day)
+                                    s_sub = s_hourly[mask]
+                                    if not s_sub.empty:
+                                        x_vals = s_sub.index.hour
+                                        fig_comp.add_trace(go.Scatter(
+                                            x=x_vals, y=s_sub, name=f"{item} ({y})", mode='lines+markers'
+                                        ))
+                                xaxis_args_comp = {'title': f"Hora ({target_day}/{target_month})", 'tickmode': 'linear', 'dtick': 1}
+
+                        fig_comp.update_layout(title="Evolució Comparativa (Multianual)", xaxis=xaxis_args_comp, hovermode="x unified")
+                        st.plotly_chart(fig_comp, use_container_width=True)
+                else:
+                    st.info("Selecciona almenys una sèrie per visualitzar.")
 
             # --- Tab 3: Public Lighting Auditor ---
             with tab3:
@@ -606,61 +703,79 @@ def main():
                     # 1. Automated Scanner
                     st.subheader("🕵️ Detecció d'Incidències (Massiva)")
                     
-                    if st.button("Buscar Anomalies en tot el període"):
-                        with st.spinner("Analitzant dies i CUPS..."):
-                            anomalies = []
-                            city = LocationInfo("Girona", "Catalonia", "Europe/Madrid", 41.9, 2.8)
-                            
-                            # Iterate over all dates in the df
-                            all_dates = df.index.date
-                            unique_dates = sorted(list(set(all_dates)))
-                            
-                            # Optimization: Pre-calculate sun info for all dates? 
-                            # Or just loop, astral is fast.
-                            
-                            progress_bar = st.progress(0)
-                            total_steps = len(unique_dates)
-                            
-                            for i, d in enumerate(unique_dates):
-                                # Sun info
-                                s = sun(city.observer, date=d)
-                                sunrise = s['sunrise'].replace(tzinfo=None)
-                                sunset = s['sunset'].replace(tzinfo=None)
+                    # Year Selector for Scanner
+                    available_years_scan = sorted(df.index.year.unique())
+                    scan_years = st.multiselect("Anys a Escanejar", available_years_scan, default=available_years_scan, key="scan_years_sel")
+                    
+                    if st.button("Buscar Anomalies"):
+                        if not scan_years:
+                            st.warning("Selecciona almenys un any per escanejar.")
+                        else:
+                            with st.spinner(f"Analitzant CUPS per als anys: {scan_years}..."):
+                                anomalies = []
+                                total_excess_kwh = 0.0
                                 
-                                # Get day data slice
-                                day_data = df.loc[df.index.date == d]
+                                # Filter DF per Selected Years
+                                df_scan = df[df.index.year.isin(scan_years)]
                                 
-                                for cup in lighting_selected:
-                                    # Get AE col
-                                    cols = df[cup].columns
-                                    ae_col = [c for c in cols if 'AE' in c and 'kWh' in c and 'AUTOCONS' not in c]
-                                    if not ae_col: continue
+                                # Optimize: Iterate by day is slow if many cups. 
+                                # But logic requires sunset/sunrise which is daily.
+                                unique_days_scan = sorted(list(set(df_scan.index.date)))
+                                
+                                progress_bar = st.progress(0)
+                                total_steps = len(unique_days_scan)
+                                
+                                for i, d in enumerate(unique_days_scan):
+                                    # Sun info
+                                    city = LocationInfo("Girona", "Catalonia", "Europe/Madrid", 41.9, 2.8)
+                                    s = sun(city.observer, date=d)
+                                    sunrise = s['sunrise'].replace(tzinfo=None)
+                                    sunset = s['sunset'].replace(tzinfo=None)
                                     
-                                    series = day_data[cup][ae_col[0]]
+                                    # Get day data slice
+                                    day_data = df_scan.loc[df_scan.index.date == d]
                                     
-                                    # Check 1: Day Burning (Consumption > threshold between Sunrise+1h and Sunset-1h to be safe/strict?)
-                                    # User asked simply "does not comply". Let's stick to strict sunrise-sunset
-                                    day_mask = (series.index > sunrise) & (series.index < sunset)
-                                    day_kwh = series[day_mask].sum()
-                                    
-                                    if day_kwh > 1.0: # Tolerance 1 kWh
-                                        anomalies.append({
-                                            "Data": d,
-                                            "CUPS": cup,
-                                            "Tipus": "Encesa Diürna",
-                                            "Valor": f"{day_kwh:.2f} kWh"
-                                        })
+                                    for cup in lighting_selected:
+                                        # Get AE col
+                                        cols = df_scan[cup].columns
+                                        ae_col = [c for c in cols if 'AE' in c and 'kWh' in c and 'AUTOCONS' not in c]
+                                        if not ae_col: continue
                                         
-                                if i % 10 == 0:
-                                    progress_bar.progress(i / total_steps)
-                                    
-                            progress_bar.progress(1.0)
-                            st.session_state['anomalies_found'] = anomalies
+                                        series = day_data[cup][ae_col[0]]
+                                        
+                                        # Check 1: Day Burning (Consumption > threshold between Sunrise+1h and Sunset-1h to be safe/strict?)
+                                        try:
+                                            day_mask = (series.index > sunrise) & (series.index < sunset)
+                                            day_kwh = series[day_mask].sum()
+                                            
+                                            if day_kwh > 1.0: # Tolerance 1 kWh
+                                                anomalies.append({
+                                                    "Data": d,
+                                                    "CUPS": cup,
+                                                    "Tipus": "Encesa Diürna",
+                                                    "Valor": f"{day_kwh:.2f} kWh"
+                                                })
+                                                total_excess_kwh += day_kwh
+                                        except Exception:
+                                            pass # Skip if index issues
+                                            
+                                    if i % 10 == 0:
+                                        progress_bar.progress(i / total_steps)
+                                        
+                                progress_bar.progress(1.0)
+                                st.session_state['anomalies_found'] = anomalies
+                                st.session_state['anomalies_total_kwh'] = total_excess_kwh
                             
                     # Display results if available
                     if 'anomalies_found' in st.session_state and st.session_state['anomalies_found']:
                         anomalies_df = pd.DataFrame(st.session_state['anomalies_found'])
-                        st.error(f"S'han detectat {len(anomalies_df)} incidències.")
+                        
+                        # Summary Metrics
+                        col_alert, col_total = st.columns([2, 1])
+                        col_alert.error(f"⚠️ S'han detectat {len(anomalies_df)} incidències.")
+                        col_total.metric("Total kWh Detectats (Estimat)", f"{st.session_state.get('anomalies_total_kwh', 0):.2f} kWh")
+                        
+                        st.caption("ℹ️ Nota: Aquest càlcul és una estimació basada en dades horàries. La precisió exacta de l'encesa/apagada depèn de la resolució de les dades (horària vs minutal).")
                         
                         # Selector to view specific anomaly
                         anomaly_options = [f"{row['Data']} - {row['CUPS']} ({row['Valor']})" for index, row in anomalies_df.iterrows()]
@@ -724,28 +839,264 @@ def main():
             # --- Tab 4: AI Advisor ---
             with tab4:
                 st.header("🤖 Assistent Virtual")
-                st.info("Revisant tots els CUPS carregats...")
                 
-                # Heuristic loop all cups
-                # Use ALL cups for advice, not just selected
-                count_issues = 0
-                for cup in all_cups:
-                    # Get data
-                    cols = df[cup].columns
-                    ae_col = [c for c in cols if 'AE' in c and 'kWh' in c and 'AUTOCONS' not in c][0]
-                    series = df[cup][ae_col]
+                with st.expander("ℹ️ Com funciona aquest assistent?"):
+                    st.markdown("""
+                    Aquest assistent aplica regles heurístiques per detectar patrons anòmals o interessants:
                     
-                    # Logic 1: Day Burning (Aggregated check)
-                    day_mask = (series.index.hour >= 10) & (series.index.hour <= 16)
-                    day_kwh = series[day_mask].sum()
-                    total_kwh_c = series.sum()
+                    **1. Encesa Diürna Sistemàtica (Enllumenat):**
+                    *   Busca quadres d'enllumenat que consumeixen >15% del total entre 10h i 16h (indicador de rellotge espatllat).
                     
-                    if total_kwh_c > 0 and (day_kwh / total_kwh_c) > 0.15 and cup in lighting_cups:
-                        st.warning(f"⚠️ **{cup}**: Possible encesa diürna SYSTEMÀTICA. {day_kwh:.0f} kWh consumits entre 10h i 16h total.")
-                        count_issues += 1
-                        
-                if count_issues == 0:
-                    st.success("El sistema no ha detectat anomalies greus automàtiques.")
+                    **2. Consum Nocturn Elevat (Edificis):**
+                    *   Analitza edificis (escoles, pavellons...) que tenen un consum "base" nocturn (00h-06h) superior al 20% del dia. Pot indicar climatització encesa o equips fantasma.
+                    
+                    **3. Calendari Escolar i Festius (Escoles/Llar):**
+                    *   Revisa dies on l'escola hauria d'estar tancada (caps de setmana i festius comuns). Si el consum supera el 30% d'un dia laborable normal, s'alerta.
+                    
+                    **4. Anàlisi Estacional:**
+                    *   Compara l'hivern (Des-Feb) amb l'estiu (Jun-Ago) per determinar si l'edifici és "Hivernal" (Calefacció) o "Estival" (Aire Condicionat).
+                    """)
+                
+                # Initialize session state for advisor
+                if 'show_advanced_advisor' not in st.session_state:
+                    st.session_state.show_advanced_advisor = False
 
+                if st.button("Executar Anàlisi Avançada"):
+                    st.session_state.show_advanced_advisor = True
+                
+                if st.session_state.show_advanced_advisor:
+                    st.write("---")
+                    with st.spinner("Analitzant patrons complexos..."):
+                        
+                        # --- 1. NIGHT CONSUMPTION CHECK (BUILDINGS) ---
+                        st.subheader("🌙 Consum Nocturn Elevat (Edificis)")
+                        night_anomalies = []
+                        
+                        # Use all dates
+                        unique_dates = sorted(list(set(df.index.date)))
+                        
+                        # Pre-calculate building list
+                        # Only check if CUPS is in building_cups and NOT simply a default name if possible, 
+                        # but building_cups is robust enough based on classification.
+                        
+                        for d in unique_dates:
+                             day_data = df.loc[df.index.date == d]
+                             
+                             for cup in building_cups: # Only buildings
+                                 cols = df[cup].columns
+                                 ae_col = [c for c in cols if 'AE' in c and 'kWh' in c and 'AUTOCONS' not in c]
+                                 if not ae_col: continue
+                                 series = day_data[cup][ae_col[0]]
+                                 
+                                 if series.sum() > 5.0: # Minimum relevance threshold (5 kWh total day)
+                                     night_mask = (series.index.hour >= 0) & (series.index.hour < 6)
+                                     night_kwh = series[night_mask].sum()
+                                     total_day = series.sum()
+                                     
+                                     if (night_kwh / total_day) > 0.20:
+                                         night_anomalies.append({
+                                             "Data": d, "CUPS": cup, "Nocturn": f"{night_kwh:.2f} kWh", 
+                                             "Total": f"{total_day:.2f} kWh", "Rati": f"{(night_kwh/total_day*100):.1f}%"
+                                         })
+                        
+                        if night_anomalies:
+                            df_night = pd.DataFrame(night_anomalies)
+                            st.warning(f"S'han detectat {len(df_night)} dies amb consum nocturn elevat (>20%).")
+                            
+                            # Interactive View
+                            opt_night = [f"{r['Data']} - {r['CUPS']} ({r['Rati']})" for i, r in df_night.iterrows()]
+                            sel_night = st.selectbox("Veure Detall Nocturn", opt_night)
+                            
+                            if sel_night:
+                                idx_n = opt_night.index(sel_night)
+                                row_n = df_night.iloc[idx_n]
+                                viewing_date_n = row_n['Data']
+                                viewing_cup_n = row_n['CUPS']
+                                
+                                # Plot logic (Quick Re-use)
+                                dd_n = df.loc[df.index.date == viewing_date_n]
+                                cc_n = df[viewing_cup_n].columns
+                                ae_n = [c for c in cc_n if 'AE' in c and 'kWh' in c][0]
+                                s_n = dd_n[viewing_cup_n][ae_n]
+                                
+                                fig_n = px.line(s_n, title=f"Consum Nocturn: {viewing_cup_n} ({viewing_date_n})", markers=True)
+                                # Highlight night
+                                fig_n.add_vrect(x0=s_n.index[0], x1=s_n.index[0].replace(hour=6), fillcolor="blue", opacity=0.1, annotation_text="0h-6h")
+                                fig_n.update_layout(xaxis=dict(dtick=3600000, tickformat="%H:%M"))
+                                st.plotly_chart(fig_n, use_container_width=True)
+                        else:
+                            st.success("✅ No s'han detectat consums nocturns anòmals en edificis.")
+
+                        st.markdown("---")
+
+                        # --- 2. SCHOOL CALENDAR CHECK ---
+                        st.subheader("🎓 Anàlisi Calendari Escolar")
+                        school_keywords = ['escola', 'llar', 'col·legi', 'institut']  # Keywords
+                        
+                        # Auto-detect
+                        detected_schools = []
+                        import re
+                        for c in all_cups:
+                             # c is the name now (because of parse_data change or fallback)
+                             if any(k in c.lower() for k in school_keywords):
+                                detected_schools.append(c)
+                        
+                        # Manual Selector Override
+                        selected_schools = st.multiselect("Seleccionar Escoles/Llars manualment:", all_cups, default=detected_schools)
+                        
+                        school_anomalies = []
+                        
+                        if not selected_schools:
+                            st.info("Selecciona els CUPS que corresponen a escoles per analitzar-los.")
+                        else:
+                            st.write(f"Analitzant: {', '.join(selected_schools)}")
+                            
+                            for c in selected_schools:
+                                days_data = [] 
+                                cols = df[c].columns
+                                ae_col = [k for k in cols if 'AE' in k and 'kWh' in k][0]
+                                daily_sums = df[c][ae_col].resample('1d').sum() 
+                                
+                                # Baseline: Mean of Tues/Wed/Thu
+                                weekdays_mask = (daily_sums.index.dayofweek.isin([1,2,3])) 
+                                baseline = daily_sums[weekdays_mask].mean()
+                                if pd.isna(baseline) or baseline == 0: baseline = 1.0 
+                                
+                                # Iterate days
+                                for d_ts, kwh_val in daily_sums.items():
+                                    is_weekend = d_ts.dayofweek >= 5 
+                                    is_holiday = (d_ts.month == 8) or (d_ts.month == 12 and d_ts.day > 23)
+                                    
+                                    if (is_weekend or is_holiday):
+                                        if kwh_val > (baseline * 0.30) and kwh_val > 5.0: 
+                                            school_anomalies.append({
+                                                "Data": d_ts.date(), 
+                                                "CUPS": c,
+                                                "Raw_CUPS": c,
+                                                "Motiu": "Cap de Setmana/Festiu" if is_weekend else "Vacances (Agost/Nadal)",
+                                                "Consum": f"{kwh_val:.2f} kWh",
+                                                "Ref. Laborable": f"{baseline:.2f} kWh"
+                                            })
+                            
+                            if school_anomalies:
+                                df_school = pd.DataFrame(school_anomalies)
+                                st.warning(f"S'han detectat {len(df_school)} dies amb consum alt en període inactiu.")
+                                st.dataframe(df_school.drop(columns=['Raw_CUPS'], errors='ignore'))
+                                
+                                # Interactive Viewer for School
+                                opt_sch = [f"{r['Data']} - {r['CUPS']} ({r['Motiu']})" for i, r in df_school.iterrows()]
+                                sel_sch = st.selectbox("Veure Dia Escolar Anòmal", opt_sch)
+                                if sel_sch:
+                                    idx_s = opt_sch.index(sel_sch)
+                                    r_s = df_school.iloc[idx_s]
+                                    vd_s = r_s['Data']
+                                    raw_cup_s = r_s['Raw_CUPS']
+                                    
+                                    # Plot
+                                    dd_s = df.loc[df.index.date == vd_s]
+                                    cc_s = df[raw_cup_s].columns
+                                    ae_s_col = [x for x in cc_s if 'AE' in x and 'kWh' in x][0]
+                                    series_s = dd_s[raw_cup_s][ae_s_col]
+                                    
+                                    fig_s = px.line(series_s, title=f"Consum Anòmal: {r_s['CUPS']} ({vd_s})", markers=True)
+                                    fig_s.update_layout(xaxis=dict(dtick=3600000, tickformat="%H:%M"))
+                                    st.plotly_chart(fig_s, use_container_width=True)
+                            else:
+                                st.success("✅ Les escoles semblen apagar correctament en festius.")
+
+                        st.markdown("---")
+
+                        # --- 3. SEASONAL PATTERN ANALYSIS ---
+                        st.subheader("❄️☀️ Anàlisi Estacional (Hivern vs Estiu)")
+                        
+                        seasonal_data = []
+                        for c in building_cups:
+                            cols = df[c].columns
+                            ae_col = [k for k in cols if 'AE' in k and 'kWh' in k][0]
+                            series = df[c][ae_col]
+                            
+                            # Winter: Dec, Jan, Feb
+                            mask_winter = (series.index.month.isin([12, 1, 2]))
+                            avg_winter = series[mask_winter].resample('1d').sum().mean()
+                            
+                            # Summer: Jun, Jul, Aug
+                            mask_summer = (series.index.month.isin([6, 7, 8]))
+                            avg_summer = series[mask_summer].resample('1d').sum().mean()
+                            
+                            # Avoid NaN
+                            avg_winter = avg_winter if not pd.isna(avg_winter) else 0
+                            avg_summer = avg_summer if not pd.isna(avg_summer) else 0
+                            
+                            classification = "Neutre"
+                            if avg_winter > (avg_summer * 1.5):
+                                classification = "🔴 Hivernal (Calefacció?)"
+                            elif avg_summer > (avg_winter * 1.5):
+                                classification = "🔵 Estival (Aire Cond.?)"
+                                
+                            seasonal_data.append({
+                                "CUPS": c, # Use c as it might be name now
+                                "Mitjana Hivern": f"{avg_winter:.1f} kWh",
+                                "Mitjana Estiu": f"{avg_summer:.1f} kWh",
+                                "Patró Detectat": classification
+                            })
+                            
+                        st.table(pd.DataFrame(seasonal_data))
+
+                        st.markdown("---")
+
+                        # --- 4. TEMPORAL PATTERN ANALYSIS (WEEKLY & HOURLY) ---
+                        st.subheader("📊 Anàlisi de Patrons Temporals (Setmanal i Horari)")
+                        
+                        temporal_data = []
+                        
+                        for c in building_cups:
+                            cols = df[c].columns
+                            ae_col = [k for k in cols if 'AE' in k and 'kWh' in k][0]
+                            series = df[c][ae_col]
+                            
+                            # 1. Weekly Pattern
+                            # Resample by day first to get daily totals
+                            daily = series.resample('1d').sum()
+                            # Group by day of week (0=Mon, 6=Sun)
+                            weekly_avg = daily.groupby(daily.index.dayofweek).mean()
+                            
+                            avg_workday = weekly_avg[0:5].mean()
+                            avg_weekend = weekly_avg[5:7].mean()
+                            
+                            # Determine Pattern Type
+                            if avg_workday > 0:
+                                ratio_weekend = avg_weekend / avg_workday
+                            else:
+                                ratio_weekend = 1.0 # No consumption?
+                                
+                            patro_setmanal = "Indefinit"
+                            if ratio_weekend < 0.4:
+                                patro_setmanal = "🏢 Laborable (Tanca cap de setmana)"
+                            elif ratio_weekend > 0.9:
+                                patro_setmanal = "🔄 Continu (7 dies)"
+                            else:
+                                patro_setmanal = "Mixt"
+                                
+                            # 2. Hourly Pattern
+                            # Group by hour
+                            hourly_avg = series.groupby(series.index.hour).mean()
+                            peak_hour = hourly_avg.idxmax()
+                            
+                            # Simple classification
+                            if 8 <= peak_hour <= 18:
+                                patro_horari = f"☀️ Diürn (Pic: {peak_hour}h)"
+                            elif 19 <= peak_hour <= 23:
+                                patro_horari = f"💡 Vespre (Pic: {peak_hour}h)"
+                            else:
+                                patro_horari = f"🌙 Nocturn (Pic: {peak_hour}h)"
+                                
+                            temporal_data.append({
+                                "CUPS": c,
+                                "Patró Setmanal": patro_setmanal,
+                                "Patró Horari": patro_horari,
+                                "Ratio CapDeSetmana": f"{ratio_weekend*100:.0f}%"
+                            })
+                            
+                        st.table(pd.DataFrame(temporal_data))
 if __name__ == "__main__":
     main()
