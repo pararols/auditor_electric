@@ -38,7 +38,7 @@ CUPS_MAPPING = {
     "ES0031408332025001ZK0F": "Polivalent",
     "ES0031408457126001XL0F": "Pavelló",
     "ES0031408528667001SW0F": "Enll C/ nou",
-    "ES0031406053346001CK0F": "Can Burcet"
+    "ES0031408691405001KF0F": "Can Burcet",
 }
 
 # --- CSS Styling ---
@@ -632,15 +632,26 @@ def main():
                                 # Resample to Monthly first
                                 s_monthly = s_full.resample('ME').sum()
                                 
+                                month_map = {1: 'Gen', 2: 'Feb', 3: 'Mar', 4: 'Abr', 5: 'Mai', 6: 'Jun', 
+                                             7: 'Jul', 8: 'Ago', 9: 'Set', 10: 'Oct', 11: 'Nov', 12: 'Des'}
+                                
                                 for y in selected_years_comp:
                                     s_year = s_monthly[s_monthly.index.year == y]
                                     if not s_year.empty:
-                                        x_vals = s_year.index.strftime('%b') 
+                                        # Use Month Numbers (1-12) for X to ensure correct sorting/stacking
+                                        x_vals = s_year.index.month
                                         fig_comp.add_trace(go.Scatter(
                                             x=x_vals, y=s_year, name=f"{item} ({y})", mode='lines+markers',
                                             hovertemplate="%{y:.2f} kWh<extra></extra>"
                                         ))
-                                xaxis_args_comp = {'title': "Mes", 'dtick': 1}
+                                
+                                # Force X-Axis to show all 12 months with names
+                                xaxis_args_comp = {
+                                    'title': "Mes", 
+                                    'tickmode': 'array',
+                                    'tickvals': list(range(1, 13)),
+                                    'ticktext': list(month_map.values())
+                                }
 
                             elif mode_t2 == 'Mensual':
                                 target_month = current_anchor.month
@@ -688,6 +699,38 @@ def main():
 
                         fig_comp.update_layout(title="Evolució Comparativa (Multianual)", xaxis=xaxis_args_comp, hovermode="x unified")
                         st.plotly_chart(fig_comp, use_container_width=True)
+
+                        # SUMMARY TABLE (Tab 2)
+                        st.subheader("Resum Series Seleccionades (Període/Anys)")
+                        if selected_years_comp:
+                            # Matrix Structure: Rows=Series, Cols=Years
+                            data_matrix = []
+                            
+                            for it in selection_series:
+                                row_dict = {"Sèrie": it}
+                                
+                                # Get Data
+                                if it == "TOTAL": s_f, _ = get_aggregated_data(df, all_cups)
+                                elif it == "ENLLUMENAT (Agregat)": s_f, _ = get_aggregated_data(df, lighting_cups)
+                                elif it == "EDIFICIS (Agregat)": s_f, _ = get_aggregated_data(df, building_cups)
+                                else:
+                                     cols = df[it].columns
+                                     ae_c = [c for c in cols if 'AE' in c and 'kWh' in c and 'AUTOCONS' not in c]
+                                     if ae_c: s_f = df[it][ae_c[0]]
+                                     else: continue
+                                
+                                # Calculate Per Year
+                                total_row = 0
+                                for y in selected_years_comp:
+                                    mask_y = s_f.index.year == y
+                                    val_y = s_f[mask_y].sum()
+                                    row_dict[str(y)] = f"{val_y:.2f}"
+                                    total_row += val_y
+                                
+                                # row_dict["Total Període"] = f"{total_row:.2f}" # Optional, if they said "no sum" maybe they don't want total? Let's keep specific years.
+                                data_matrix.append(row_dict)
+                            
+                            st.dataframe(pd.DataFrame(data_matrix))
                 else:
                     st.info("Selecciona almenys una sèrie per visualitzar.")
 
@@ -708,6 +751,19 @@ def main():
                     scan_years = st.multiselect("Anys a Escanejar", available_years_scan, default=available_years_scan, key="scan_years_sel")
                     
                     if st.button("Buscar Anomalies"):
+                        should_run = True
+                    else:
+                        # Logic to Auto-Run if years changed and we have results
+                        if 'scan_years_last_run' in st.session_state:
+                            if set(st.session_state.scan_years_last_run) != set(scan_years):
+                                should_run = True
+                            else:
+                                should_run = False
+                        else:
+                            should_run = False
+                    
+                    # RUN SCANNER
+                    if should_run:
                         if not scan_years:
                             st.warning("Selecciona almenys un any per escanejar.")
                         else:
@@ -751,9 +807,10 @@ def main():
                                             if day_kwh > 1.0: # Tolerance 1 kWh
                                                 anomalies.append({
                                                     "Data": d,
-                                                    "CUPS": cup,
+                                                    "CUPS": CUPS_MAPPING.get(cup, cup),
                                                     "Tipus": "Encesa Diürna",
-                                                    "Valor": f"{day_kwh:.2f} kWh"
+                                                    "Valor": f"{day_kwh:.2f} kWh",
+                                                    "Raw_CUPS": cup  # For plotting laters
                                                 })
                                                 total_excess_kwh += day_kwh
                                         except Exception:
@@ -765,19 +822,31 @@ def main():
                                 progress_bar.progress(1.0)
                                 st.session_state['anomalies_found'] = anomalies
                                 st.session_state['anomalies_total_kwh'] = total_excess_kwh
+                                st.session_state['scan_years_last_run'] = scan_years
+                                
+                                # Calculate Calculation Base: Total Lighting Consumption in Selected Years
+                                lighting_total_scan, _ = get_aggregated_data(df_scan, lighting_selected)
+                                st.session_state['scan_lighting_total_kwh'] = lighting_total_scan.sum()
                             
                     # Display results if available
                     if 'anomalies_found' in st.session_state and st.session_state['anomalies_found']:
                         anomalies_df = pd.DataFrame(st.session_state['anomalies_found'])
                         
-                        # Summary Metrics
-                        col_alert, col_total = st.columns([2, 1])
+                        # Metrics
+                        total_detected = st.session_state.get('anomalies_total_kwh', 0)
+                        total_baseline = st.session_state.get('scan_lighting_total_kwh', 1) # Avoid div0
+                        pct_excess = (total_detected / total_baseline) * 100 if total_baseline > 0 else 0
+                        
+                        col_alert, col_total, col_pct = st.columns([2, 1, 1])
                         col_alert.error(f"⚠️ S'han detectat {len(anomalies_df)} incidències.")
-                        col_total.metric("Total kWh Detectats (Estimat)", f"{st.session_state.get('anomalies_total_kwh', 0):.2f} kWh")
+                        col_total.metric("Energia Malbaratada (Est.)", f"{total_detected:.2f} kWh")
+                        col_pct.metric("% sobre Total Enllumenat", f"{pct_excess:.2f} %")
                         
                         st.caption("ℹ️ Nota: Aquest càlcul és una estimació basada en dades horàries. La precisió exacta de l'encesa/apagada depèn de la resolució de les dades (horària vs minutal).")
                         
                         # Selector to view specific anomaly
+                        # Sort by date desc
+                        anomalies_df = anomalies_df.sort_values(by="Data", ascending=False)
                         anomaly_options = [f"{row['Data']} - {row['CUPS']} ({row['Valor']})" for index, row in anomalies_df.iterrows()]
                         selected_anomaly_str = st.selectbox("Seleccionar Incidència per visualitzar", anomaly_options)
                         
