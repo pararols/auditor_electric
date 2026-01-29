@@ -445,7 +445,9 @@ def render_executive_report(df, lighting_cups, building_cups, all_cups):
     else:
         # Calculate Total Self Consumption for Target Year
         total_self_year = 0
-        total_grid_year = total_target # Already calculated above (Sum of AE for all cups)
+        total_grid_year = total_target # This is Sum of AE for all cups (filtered to community if scoped)
+        # Note: Logic Update. Grid Column IS the Total Building Consumption.
+        # So total_target calculated from AE columns ALREADY represents the Total Demand of the buildings.
         
         # We need to sum AE_AUTOCONS for target year
         for c in self_cups:
@@ -454,7 +456,7 @@ def render_executive_report(df, lighting_cups, building_cups, all_cups):
              if auto_col:
                  total_self_year += df_target[c][auto_col[0]].sum()
         
-        total_muni_demand = total_grid_year + total_self_year
+        total_muni_demand = total_grid_year 
         impact_pct = (total_self_year / total_muni_demand * 100) if total_muni_demand > 0 else 0
         
         # KPIs
@@ -474,20 +476,28 @@ def render_executive_report(df, lighting_cups, building_cups, all_cups):
                  s_monthly_self = s_monthly_self.add(df_target[c][auto_col[0]].resample('ME').sum(), fill_value=0)
         
         # Prepare Chart Data
+        # Logic Update: Grid Column is Total. Self is part of it.
+        # We want to stack: Self (Gold) + Net Grid (Grey) = Total Grid (Height).
+        
+        s_total = df_chart[f"{target_year}"] # Only sums AE cols of involved cups
+        s_self = fill_vals(s_monthly_self, target_year)
+        s_net_grid = []
+        for t, s in zip(s_total, s_self):
+            s_net_grid.append(max(0, t - s))
+
         df_comm = pd.DataFrame({
             "Mes": range(1, 13),
-            "Generació Solar": fill_vals(s_monthly_self, target_year),
-            "Consum Xarxa Total": df_chart[f"{target_year}"] # Re-use existing bar data
+            "Generació Solar": s_self,
+            "Xarxa (Facturat)": s_net_grid 
         })
         df_comm["NomMes"] = df_comm["Mes"].map(month_names)
         
         fig_comm = go.Figure()
         fig_comm.add_trace(go.Bar(x=df_comm["NomMes"], y=df_comm["Generació Solar"], name="Autoconsum Solar", marker_color="gold"))
-        # Add Line for Total Consumption context? Or just separate bar?
-        # Let's show as separate bar to compare magnitude
-        fig_comm.add_trace(go.Bar(x=df_comm["NomMes"], y=df_comm["Consum Xarxa Total"], name="Consum Xarxa (Ajuntament)", marker_color="lightgray"))
+        # Stacked on top: Net Grid
+        fig_comm.add_trace(go.Bar(x=df_comm["NomMes"], y=df_comm["Xarxa (Facturat)"], name="Xarxa (Restant Facturat)", marker_color="lightgray"))
         
-        fig_comm.update_layout(title="Comparativa: Generació Solar vs Consum Xarxa", xaxis={'categoryorder': 'array', 'categoryarray': list(month_names.values())})
+        fig_comm.update_layout(title="Comparativa: Autoconsum vs Facturació Xarxa", xaxis={'categoryorder': 'array', 'categoryarray': list(month_names.values())}, barmode='stack')
         st.plotly_chart(fig_comm, use_container_width=True)
 
 
@@ -1482,10 +1492,20 @@ def main():
                 if not self_consumption_cups:
                     st.info("No s'han detectat punts de la Comunitat Energètica amb dades d'autoconsum.")
                 else:
-                    # Filter Data for Solar CUPS
-                    solar_df = df_filtered_t1[self_consumption_cups] if not df_filtered_t1.empty else df[self_consumption_cups]
-                    if 'anchor_date' in st.session_state: # Use global time filter if possible or just use what's available
-                        pass
+                    # Year Selection Filter (Tab 5 specific)
+                    available_years = sorted(df.index.year.unique())
+                    selected_years_t5 = st.multiselect("Filtrar per Anys", available_years, default=available_years, key='t5_year_filter')
+                    
+                    # Filter Data for Solar CUPS & Selected Years
+                    # Start with full DF (or filtered T1 if relevant, but T5 usually independent like Advisor)
+                    # Let's base on original DF to allow full year range selection independent of T1
+                    solar_df = df[self_consumption_cups]
+                    
+                    if selected_years_t5:
+                         solar_df = solar_df[solar_df.index.year.isin(selected_years_t5)]
+                    else:
+                         st.warning("Selecciona almenys un any.")
+                         solar_df = pd.DataFrame() # Empty
 
                     # Helpers for Self Consumption
                     
@@ -1502,34 +1522,38 @@ def main():
                         val_grid = 0
                         val_self = 0
                         
-                        if ae_col: val_grid = df_filtered_t1[cup][ae_col[0]].sum()
-                        if auto_col: val_self = df_filtered_t1[cup][auto_col[0]].sum()
+                        if ae_col: val_grid = solar_df[cup][ae_col[0]].sum() # Changed to solar_df to respect year filter
+                        if auto_col: val_self = solar_df[cup][auto_col[0]].sum()
                         
-                        total_demand = val_grid + val_self
+                        # Logic Update: Grid IS Total.
+                        total_demand = val_grid 
                         autarchy_pct = (val_self / total_demand * 100) if total_demand > 0 else 0
+                        
+                        net_grid = val_grid - val_self
                         
                         data_summary.append({
                             "CUPS": CUPS_MAPPING.get(cup, cup),
-                            "Xarxa (kWh)": val_grid,
+                            "Total Consum (kWh)": val_grid,
                             "Autoconsum (kWh)": val_self,
-                            "Demanda Total (kWh)": total_demand,
-                            "% Autarquia": autarchy_pct
+                            "Xarxa Facturat (kWh)": net_grid,
+                            "% Autoconsum": autarchy_pct
                         })
                         
                         total_grid_kwh += val_grid
                         total_self_kwh += val_self
                         
                     # Community Totals
-                    comm_demand = total_grid_kwh + total_self_kwh
+                    comm_demand = total_grid_kwh 
+                    comm_net_grid = comm_demand - total_self_kwh
                     comm_autarchy = (total_self_kwh / comm_demand * 100) if comm_demand > 0 else 0
                     
                     # --- KPIs ---
                     st.subheader("Balanç Global de la Comunitat (Total Participants)")
                     k1, k2, k3, k4 = st.columns(4)
-                    k1.metric("Demanda Total Comunitat", f"{comm_demand:,.0f} kWh")
+                    k1.metric("Total Consum Edificis", f"{comm_demand:,.0f} kWh")
                     k2.metric("Generació Autoconsumida", f"{total_self_kwh:,.0f} kWh")
-                    k3.metric("Importat Xarxa", f"{total_grid_kwh:,.0f} kWh")
-                    k4.metric("% Autarquia Mitjana", f"{comm_autarchy:.1f}%")
+                    k3.metric("Xarxa (Facturat Estim.)", f"{comm_net_grid:,.0f} kWh")
+                    k4.metric("% Autoconsum Mitjà", f"{comm_autarchy:.1f}%")
                     
                     st.markdown("---")
                     
@@ -1538,36 +1562,65 @@ def main():
                     ts_grid = pd.Series(0.0, index=df_filtered_t1.index)
                     ts_self = pd.Series(0.0, index=df_filtered_t1.index)
                     
-                    for cup in self_consumption_cups:
-                         cols = df[cup].columns
-                         ae_col = [c for c in cols if 'AE' in c and 'kWh' in c and 'AUTOCONS' not in c]
-                         auto_col = [c for c in cols if 'AE' in c and 'kWh' in c and 'AUTOCONS' in c]
+                    for c in self_consumption_cups:
+                         cols = solar_df[c].columns 
+                         ae_col = [x for x in cols if 'AE' in x and 'kWh' in x and 'AUTOCONS' not in x]
+                         auto_col = [x for x in cols if 'AE' in x and 'kWh' in x and 'AUTOCONS' in x]
                          
-                         if ae_col: ts_grid = ts_grid.add(df_filtered_t1[cup][ae_col[0]], fill_value=0)
-                         if auto_col: ts_self = ts_self.add(df_filtered_t1[cup][auto_col[0]], fill_value=0)
+                         if ae_col: ts_grid = ts_grid.add(solar_df[c][ae_col[0]], fill_value=0)
+                         if auto_col: ts_self = ts_self.add(solar_df[c][auto_col[0]], fill_value=0)
                     
                     # Resample for Chart
-                    days = (df_filtered_t1.index.max() - df_filtered_t1.index.min()).days
-                    freq = '1d' if days < 60 else '1W' if days < 365 else 'ME'
+                    days = (solar_df.index.max() - solar_df.index.min()).days
+                    resample_freq = '1d' if days < 60 else '1W' if days < 365 else 'ME'
                     
-                    chart_grid = ts_grid.resample(freq).sum()
-                    chart_self = ts_self.resample(freq).sum()
-                    chart_autarchy = (chart_self / (chart_grid + chart_self) * 100).fillna(0)
+                    chart_grid = ts_grid.resample(resample_freq).sum()
+                    chart_self = ts_self.resample(resample_freq).sum()
+                    
+                    # Force Full Year X-Axis if Single Year Selected
+                    if len(selected_years_t5) == 1:
+                        target_y = selected_years_t5[0]
+                        if resample_freq == 'ME':
+                             full_idx = pd.date_range(start=f'{target_y}-01-01', end=f'{target_y}-12-31', freq='ME')
+                             # ME might give end of month. If data is Monthly, this is fine.
+                             # If data is misaligned, careful. Assuming ME aligns.
+                             chart_grid = chart_grid.reindex(full_idx, fill_value=0)
+                             chart_self = chart_self.reindex(full_idx, fill_value=0)
+                             
+                             # Format index nicely name?
+                             # Plotly handles dates generally well.
+
+                    # Calculate Net Grid (Facturat) for Chart STACKING
+                    # Logic: Grid Column IS Total.
+                    # Stack: Self + Net = Total.
+                    chart_net_grid = chart_grid - chart_self
+                    chart_net_grid = chart_net_grid.clip(lower=0)
+                    
+                    # Line Chart Metric: % Autoconsum = Self / Total * 100
+                    chart_pct = (chart_self / chart_grid * 100).fillna(0)
                     
                     c1, c2 = st.columns([2, 1])
                     
                     with c1:
                         st.markdown("##### ⚡ Evolució Mix Energètic (Comunitat)")
                         fig_bal = go.Figure()
-                        fig_bal.add_trace(go.Bar(x=chart_grid.index, y=chart_self, name='Autoconsum', marker_color='gold'))
-                        fig_bal.add_trace(go.Bar(x=chart_grid.index, y=chart_grid, name='Xarxa', marker_color='gray'))
+                        fig_bal.add_trace(go.Bar(x=chart_self.index, y=chart_self, name='Autoconsum', marker_color='gold'))
+                        # Stacked on top: Net Grid
+                        fig_bal.add_trace(go.Bar(x=chart_net_grid.index, y=chart_net_grid, name='Xarxa (Facturat)', marker_color='gray'))
+                        
                         fig_bal.update_layout(barmode='stack', xaxis_title="Temps", yaxis_title="kWh", legend=dict(orientation="h", y=1.1))
+                        # Ensure x-axis shows all months if single year (by explicit tickformat or just data presence)
+                        if len(selected_years_t5) == 1 and resample_freq == 'ME':
+                             fig_bal.update_xaxes(dtick="M1", tickformat="%b")
+                        
                         st.plotly_chart(fig_bal, use_container_width=True)
                         
-                        st.markdown("##### 📈 Evolució Autarquia (%)")
-                        fig_aut = px.line(x=chart_autarchy.index, y=chart_autarchy.values, markers=True)
+                        st.markdown("##### 📈 Evolució % Autoconsum")
+                        fig_aut = px.line(x=chart_pct.index, y=chart_pct.values, markers=True)
                         fig_aut.update_traces(line_color='green')
-                        fig_aut.update_layout(xaxis_title="Temps", yaxis_title="% Autarquia")
+                        fig_aut.update_layout(xaxis_title="Temps", yaxis_title="% Autoconsum")
+                        if len(selected_years_t5) == 1 and resample_freq == 'ME':
+                             fig_aut.update_xaxes(dtick="M1", tickformat="%b")
                         st.plotly_chart(fig_aut, use_container_width=True)
                         
                     with c2:
@@ -1576,15 +1629,17 @@ def main():
                         if not df_summ.empty:
                             fig_pie = px.pie(df_summ, values='Autoconsum (kWh)', names='CUPS', hole=0.4)
                             st.plotly_chart(fig_pie, use_container_width=True)
+                        else:
+                            st.info("Sense dades.")
 
                     st.markdown("---")
                     st.subheader("Detall per Participant")
                     st.dataframe(
                         df_summ.style.format({
-                            "Xarxa (kWh)": "{:,.0f}", 
+                            "Total Consum (kWh)": "{:,.0f}", 
                             "Autoconsum (kWh)": "{:,.0f}", 
-                            "Demanda Total (kWh)": "{:,.0f}",
-                            "% Autarquia": "{:.1f}%"
+                            "Xarxa Facturat (kWh)": "{:,.0f}",
+                            "% Autoconsum": "{:.1f}%"
                         })
                     )
 
