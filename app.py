@@ -41,6 +41,16 @@ CUPS_MAPPING = {
     "ES0031408691405001KF0F": "Can Burcet",
 }
 
+# --- Community Participants Whitelist ---
+COMMUNITY_PARTICIPANTS = [
+    "ES0031406053357001QG0F", # Sala Nova
+    "ES0031406053560001XY0F", # Escola
+    "ES0031406054170001JT0F", # Ajuntament
+    "ES0031408303814001QQ0F", # Llar Infants
+    "ES0031408332025001ZK0F", # Polivalent
+    "ES0031408457126001XL0F"  # Pavelló
+]
+
 # --- CSS Styling ---
 st.markdown("""
     <style>
@@ -307,7 +317,14 @@ def render_executive_report(df, lighting_cups, building_cups, all_cups):
     light_target = get_sum(df_target, lighting_cups)
     build_target = get_sum(df_target, building_cups)
     
+    light_prev = get_sum(df_prev, lighting_cups)
+    build_prev = get_sum(df_prev, building_cups)
+    
+    light_var = ((light_target - light_prev) / light_prev * 100) if light_prev > 0 else 0
+    build_var = ((build_target - build_prev) / build_prev * 100) if build_prev > 0 else 0
+    
     col_kpi3.metric(f"Enllumenat / Edificis ({target_year})", f"{light_target:,.0f} / {build_target:,.0f} kWh")
+    col_kpi3.markdown(f"**Var:** 💡 {light_var:+.1f}% | 🏢 {build_var:+.1f}%")
     
     # 4. Monthly Evolution
     st.subheader(f"Evolució Mensual: {target_year} vs {prev_year}")
@@ -362,7 +379,11 @@ def render_executive_report(df, lighting_cups, building_cups, all_cups):
     fig_bar.add_trace(go.Bar(x=df_chart["NomMes"], y=df_chart[f"{prev_year}"], name=str(prev_year), marker_color='lightgrey'))
     fig_bar.add_trace(go.Bar(x=df_chart["NomMes"], y=df_chart[f"{target_year}"], name=str(target_year), marker_color='#1f77b4'))
     
-    fig_bar.update_layout(title="Comparativa Mensual", barmode='group')
+    fig_bar.update_layout(
+        title="Comparativa Mensual", 
+        barmode='group',
+        xaxis={'categoryorder': 'array', 'categoryarray': list(month_names.values())}
+    )
     st.plotly_chart(fig_bar, use_container_width=True)
     
     # 5. Top Movers
@@ -401,16 +422,93 @@ def render_executive_report(df, lighting_cups, building_cups, all_cups):
     st.subheader("Detall Mensual")
     st.dataframe(df_chart.style.format({f"{target_year}": "{:,.0f}", f"{prev_year}": "{:,.0f}"}), use_container_width=True)
 
+    # 7. Energy Community Impact (New)
+    st.markdown("---")
+    st.subheader("☀️ Impacte Comunitat Energètica Local")
+    
+    # Identify self-consumers existing in the DF
+    self_cups = detect_self_consumption_cups(df)
+    # Filter for Community Participants only
+    self_cups = [c for c in self_cups if c in COMMUNITY_PARTICIPANTS]
+    
+    if not self_cups:
+        st.info("No s'han detectat dades d'autoconsum en aquests anys.")
+    else:
+        # Calculate Total Self Consumption for Target Year
+        total_self_year = 0
+        total_grid_year = total_target # Already calculated above (Sum of AE for all cups)
+        
+        # We need to sum AE_AUTOCONS for target year
+        for c in self_cups:
+             cols = df_target[c].columns
+             auto_col = [x for x in cols if 'AUTOCONS' in x]
+             if auto_col:
+                 total_self_year += df_target[c][auto_col[0]].sum()
+        
+        total_muni_demand = total_grid_year + total_self_year
+        impact_pct = (total_self_year / total_muni_demand * 100) if total_muni_demand > 0 else 0
+        
+        # KPIs
+        k_c1, k_c2, k_c3, k_c4 = st.columns(4)
+        k_c1.metric("Total Autoconsumit (Any)", f"{total_self_year:,.0f} kWh")
+        k_c2.metric("Cobertura sobre Municipi", f"{impact_pct:.2f}%")
+        k_c3.metric("Punts amb Plaques", "1")
+        k_c4.metric("Punts amb Autoconsum", "6")
+        
+        # Simple Chart: Monthly Generation vs Total Demand
+        # Helper to get monthly self
+        s_monthly_self = pd.Series(0.0, index=df_target.resample('ME').sum().index)
+        for c in self_cups:
+             cols = df_target[c].columns
+             auto_col = [x for x in cols if 'AUTOCONS' in x]
+             if auto_col:
+                 s_monthly_self = s_monthly_self.add(df_target[c][auto_col[0]].resample('ME').sum(), fill_value=0)
+        
+        # Prepare Chart Data
+        df_comm = pd.DataFrame({
+            "Mes": range(1, 13),
+            "Generació Solar": fill_vals(s_monthly_self, target_year),
+            "Consum Xarxa Total": df_chart[f"{target_year}"] # Re-use existing bar data
+        })
+        df_comm["NomMes"] = df_comm["Mes"].map(month_names)
+        
+        fig_comm = go.Figure()
+        fig_comm.add_trace(go.Bar(x=df_comm["NomMes"], y=df_comm["Generació Solar"], name="Autoconsum Solar", marker_color="gold"))
+        # Add Line for Total Consumption context? Or just separate bar?
+        # Let's show as separate bar to compare magnitude
+        fig_comm.add_trace(go.Bar(x=df_comm["NomMes"], y=df_comm["Consum Xarxa Total"], name="Consum Xarxa (Ajuntament)", marker_color="lightgray"))
+        
+        fig_comm.update_layout(title="Comparativa: Generació Solar vs Consum Xarxa", xaxis={'categoryorder': 'array', 'categoryarray': list(month_names.values())})
+        st.plotly_chart(fig_comm, use_container_width=True)
+
+
+# --- Main App Interface ---
+
+def detect_self_consumption_cups(df):
+    """
+    Identifies CUPS that have 'AE_AUTOCONS' (Self-Consumption) columns.
+    Returns a list of CUPS (names/ids as in columns level 0).
+    """
+    self_consumers = []
+    for c in df.columns.get_level_values(0).unique():
+        cols = df[c].columns
+        # Check if any column contains 'AUTOCONS'
+        if any('AUTOCONS' in col_var for col_var in cols):
+             self_consumers.append(c)
+    return self_consumers
 
 # --- Main App Interface ---
 
 def main():
-    st.title("💡 Auditor Energètic & Enllumenat Públic")
+    st.title("Comptabilitat elèctrica Ajuntament de Sant Jordi Desvalls")
     
     # Init Session State
     if 'selected_cups_list' not in st.session_state: st.session_state.selected_cups_list = []
     if 'anchor_date' not in st.session_state: st.session_state.anchor_date = datetime.date.today()
-    if 'view_mode' not in st.session_state: st.session_state.view_mode = 'Mensual'
+    
+    # Default View Mode: Anual
+    if 'view_mode' not in st.session_state: st.session_state.view_mode = 'Anual'
+    if 'view_mode_t1' not in st.session_state: st.session_state.view_mode_t1 = 'Anual'
 
     # Sidebar
     st.sidebar.header("Pujar Dades")
@@ -424,25 +522,21 @@ def main():
             # Init anchor
             min_csv_date = df.index.min().date()
             max_csv_date = df.index.max().date()
+            
+            # If anchor is out of range, default to LATEST date (Max)
             if not (min_csv_date <= st.session_state.anchor_date <= max_csv_date):
-                 st.session_state.anchor_date = min_csv_date
+                 st.session_state.anchor_date = max_csv_date
 
             # --- Classification Step ---
             st.subheader("🤖 Classificació Automàtica de CUPS")
             lighting_cups, building_cups = classify_cups_by_name(df)
+            self_consumption_cups = detect_self_consumption_cups(df) # New detection
             all_cups = df.columns.get_level_values(0).unique().tolist()
             
             # Show Classification Logic Results
-            with st.expander("Veure Detall Classificació (Enllumenat vs Edificis)", expanded=True):
-                col_class_1, col_class_2 = st.columns(2)
-                # Reverse Map for Display works... (omitted detailed display code copy for brevity in replace, assuming prev block exists, but wait, I am replacing the block I just messed up)
-                # I need to be careful. The previous tool call messed up lines 337 to 394 in a weird way.
-                # I should just restore the Expanders display code here too if I'm replacing the whole Main start?
-                # No, the previous tool call FAILED to generate a valid replacement because of comments/pass use.
-                # The file content viewed in step 402 SHOWS the "pass" and weird lines.
-                # I must OVERWRITE the "pass" block with the new logic.
+            with st.expander("Veure Detall Classificació", expanded=True):
+                col_class_1, col_class_2, col_class_3 = st.columns(3)
                 
-                # Re-implementing the Expander Logic (simplified)
                 rev_map = {v: k for k, v in CUPS_MAPPING.items()}
                 def make_display_df(items):
                     rows = []
@@ -456,16 +550,22 @@ def main():
                 with col_class_2:
                     st.markdown(f"**🏢 Edificis ({len(building_cups)})**")
                     st.dataframe(make_display_df(building_cups), hide_index=True)
+                with col_class_3:
+                    st.markdown(f"**☀️ Autoconsum ({len(self_consumption_cups)})**")
+                    if self_consumption_cups:
+                        st.dataframe(make_display_df(self_consumption_cups), hide_index=True)
+                    else:
+                        st.info("Cap detectat.")
             
             # --- Mode Selection ---
             st.sidebar.divider()
-            app_mode = st.sidebar.radio("Mode de Visualització", ["Expert", "Informe Executiu"], index=0)
+            app_mode = st.sidebar.radio("Mode de Visualització", ["Expert", "Informe Executiu"], index=1)
 
             if app_mode == "Informe Executiu":
                 render_executive_report(df, lighting_cups, building_cups, all_cups)
                 return 
 
-            # === MODE: EXPERT (Implicit, proceeds below) ===
+            # === MODE: EXPERT (Implicit) ===
             
             # --- Global Filter Logic Helpers ---
             def set_cups_selection(group_type):
@@ -475,6 +575,8 @@ def main():
                     st.session_state.selected_cups_list = lighting_cups
                 elif group_type == 'Buildings':
                     st.session_state.selected_cups_list = building_cups
+                elif group_type == 'Solar':
+                    st.session_state.selected_cups_list = self_consumption_cups
                 else:
                     st.session_state.selected_cups_list = []
 
@@ -483,11 +585,17 @@ def main():
                  st.session_state.selected_cups_list = all_cups
 
             # --- Tabs ---
-            tab1, tab2, tab3, tab4 = st.tabs(["📊 Panell Global", "📈 Comparativa", "🌃 Auditor Enllumenat", "🤖 AI Advisor"])
+            tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Panell Global", "📈 Comparativa", "🌃 Auditor Enllumenat", "🤖 AI Advisor", "☀️ Autoconsum"])
             
             # === TAB 1: Global Dashboard ===
             with tab1:
                 st.header("Visió General")
+                # (Logic Continues...) Same as before roughly, just careful with indentation/structure if I overwrite heavily.
+                # Actually I am overwriting `main` start.
+                pass 
+            # I must stop here because replace needs exact match. 
+            # I will target up to "with tab1:" and rely on the fact that existing code follows.
+
                 
                 # 1. Controls Row
                 col_nav1, col_nav2, col_nav3 = st.columns([2, 1, 3])
@@ -1090,6 +1198,18 @@ def main():
                 
                 if st.session_state.show_advanced_advisor:
                     st.write("---")
+                    
+                    # --- YEAR FILTER ---
+                    all_years = sorted(df.index.year.unique().tolist())
+                    selected_years = st.multiselect("Filtrar per Anys", all_years, default=all_years)
+                    
+                    # Filter DF for Advisor
+                    if selected_years:
+                        advisor_df = df[df.index.year.isin(selected_years)]
+                    else:
+                        advisor_df = df
+                        st.warning("Selecciona almenys un any.")
+
                     with st.spinner("Analitzant patrons complexos..."):
                         
                         # --- 1. NIGHT CONSUMPTION CHECK (BUILDINGS) ---
@@ -1097,17 +1217,17 @@ def main():
                         night_anomalies = []
                         
                         # Use all dates
-                        unique_dates = sorted(list(set(df.index.date)))
+                        unique_dates = sorted(list(set(advisor_df.index.date)))
                         
                         # Pre-calculate building list
                         # Only check if CUPS is in building_cups and NOT simply a default name if possible, 
                         # but building_cups is robust enough based on classification.
                         
                         for d in unique_dates:
-                             day_data = df.loc[df.index.date == d]
+                             day_data = advisor_df.loc[advisor_df.index.date == d]
                              
                              for cup in building_cups: # Only buildings
-                                 cols = df[cup].columns
+                                 cols = advisor_df[cup].columns
                                  ae_col = [c for c in cols if 'AE' in c and 'kWh' in c and 'AUTOCONS' not in c]
                                  if not ae_col: continue
                                  series = day_data[cup][ae_col[0]]
@@ -1138,8 +1258,8 @@ def main():
                                 viewing_cup_n = row_n['CUPS']
                                 
                                 # Plot logic (Quick Re-use)
-                                dd_n = df.loc[df.index.date == viewing_date_n]
-                                cc_n = df[viewing_cup_n].columns
+                                dd_n = advisor_df.loc[advisor_df.index.date == viewing_date_n]
+                                cc_n = advisor_df[viewing_cup_n].columns
                                 ae_n = [c for c in cc_n if 'AE' in c and 'kWh' in c][0]
                                 s_n = dd_n[viewing_cup_n][ae_n]
                                 
@@ -1177,9 +1297,9 @@ def main():
                             
                             for c in selected_schools:
                                 days_data = [] 
-                                cols = df[c].columns
+                                cols = advisor_df[c].columns
                                 ae_col = [k for k in cols if 'AE' in k and 'kWh' in k][0]
-                                daily_sums = df[c][ae_col].resample('1d').sum() 
+                                daily_sums = advisor_df[c][ae_col].resample('1d').sum() 
                                 
                                 # Baseline: Mean of Tues/Wed/Thu
                                 weekdays_mask = (daily_sums.index.dayofweek.isin([1,2,3])) 
@@ -1196,8 +1316,7 @@ def main():
                                             school_anomalies.append({
                                                 "Data": d_ts.date(), 
                                                 "CUPS": c,
-                                                "Raw_CUPS": c,
-                                                "Motiu": "Cap de Setmana/Festiu" if is_weekend else "Vacances (Agost/Nadal)",
+                                                "Motiu": "Cap de Setmana/Festiu" if is_weekend else "Vacances",
                                                 "Consum": f"{kwh_val:.2f} kWh",
                                                 "Ref. Laborable": f"{baseline:.2f} kWh"
                                             })
@@ -1205,24 +1324,25 @@ def main():
                             if school_anomalies:
                                 df_school = pd.DataFrame(school_anomalies)
                                 st.warning(f"S'han detectat {len(df_school)} dies amb consum alt en període inactiu.")
-                                st.dataframe(df_school.drop(columns=['Raw_CUPS'], errors='ignore'))
+                                st.dataframe(df_school.sort_values("Data"), hide_index=True)
                                 
                                 # Interactive Viewer for School
-                                opt_sch = [f"{r['Data']} - {r['CUPS']} ({r['Motiu']})" for i, r in df_school.iterrows()]
-                                sel_sch = st.selectbox("Veure Dia Escolar Anòmal", opt_sch)
+                                opt_sch = [f"{r['Data']} - {r['CUPS']} ({r['Motiu']}) - {r['Consum']}" for i, r in df_school.iterrows()]
+                                sel_sch = st.selectbox("Veure Gràfic Dia Escolar Anòmal", opt_sch)
+                                
                                 if sel_sch:
                                     idx_s = opt_sch.index(sel_sch)
                                     r_s = df_school.iloc[idx_s]
                                     vd_s = r_s['Data']
-                                    raw_cup_s = r_s['Raw_CUPS']
+                                    target_cup_s = r_s['CUPS'] # Name or ID depending on logic
                                     
                                     # Plot
-                                    dd_s = df.loc[df.index.date == vd_s]
-                                    cc_s = df[raw_cup_s].columns
+                                    dd_s = advisor_df.loc[advisor_df.index.date == vd_s]
+                                    cc_s = advisor_df[target_cup_s].columns
                                     ae_s_col = [x for x in cc_s if 'AE' in x and 'kWh' in x][0]
-                                    series_s = dd_s[raw_cup_s][ae_s_col]
+                                    series_s = dd_s[target_cup_s][ae_s_col]
                                     
-                                    fig_s = px.line(series_s, title=f"Consum Anòmal: {r_s['CUPS']} ({vd_s})", markers=True)
+                                    fig_s = px.line(series_s, title=f"Consum Anòmal: {target_cup_s} ({vd_s}) - {r_s['Motiu']}", markers=True)
                                     fig_s.update_layout(xaxis=dict(dtick=3600000, tickformat="%H:%M"))
                                     st.plotly_chart(fig_s, use_container_width=True)
                             else:
@@ -1235,9 +1355,9 @@ def main():
                         
                         seasonal_data = []
                         for c in building_cups:
-                            cols = df[c].columns
+                            cols = advisor_df[c].columns
                             ae_col = [k for k in cols if 'AE' in k and 'kWh' in k][0]
-                            series = df[c][ae_col]
+                            series = advisor_df[c][ae_col]
                             
                             # Winter: Dec, Jan, Feb
                             mask_winter = (series.index.month.isin([12, 1, 2]))
@@ -1274,9 +1394,9 @@ def main():
                         temporal_data = []
                         
                         for c in building_cups:
-                            cols = df[c].columns
+                            cols = advisor_df[c].columns
                             ae_col = [k for k in cols if 'AE' in k and 'kWh' in k][0]
-                            series = df[c][ae_col]
+                            series = advisor_df[c][ae_col]
                             
                             # 1. Weekly Pattern
                             # Resample by day first to get daily totals
@@ -1322,5 +1442,122 @@ def main():
                             })
                             
                         st.table(pd.DataFrame(temporal_data))
+
+            # === TAB 5: Autoconsum / Comunitat Energètica ===
+            with tab5:
+                st.header("☀️ Autoconsum i Comunitat Energètica")
+                
+                # Filter for Community Participants Only
+                self_consumption_cups = [c for c in self_consumption_cups if c in COMMUNITY_PARTICIPANTS]
+                
+                if not self_consumption_cups:
+                    st.info("No s'han detectat punts de la Comunitat Energètica amb dades d'autoconsum.")
+                else:
+                    # Filter Data for Solar CUPS
+                    solar_df = df_filtered_t1[self_consumption_cups] if not df_filtered_t1.empty else df[self_consumption_cups]
+                    if 'anchor_date' in st.session_state: # Use global time filter if possible or just use what's available
+                        pass
+
+                    # Helpers for Self Consumption
+                    
+                    data_summary = []
+                    
+                    total_grid_kwh = 0
+                    total_self_kwh = 0
+                    
+                    for cup in self_consumption_cups:
+                        cols = df[cup].columns
+                        ae_col = [c for c in cols if 'AE' in c and 'kWh' in c and 'AUTOCONS' not in c]
+                        auto_col = [c for c in cols if 'AE' in c and 'kWh' in c and 'AUTOCONS' in c]
+                        
+                        val_grid = 0
+                        val_self = 0
+                        
+                        if ae_col: val_grid = df_filtered_t1[cup][ae_col[0]].sum()
+                        if auto_col: val_self = df_filtered_t1[cup][auto_col[0]].sum()
+                        
+                        total_demand = val_grid + val_self
+                        autarchy_pct = (val_self / total_demand * 100) if total_demand > 0 else 0
+                        
+                        data_summary.append({
+                            "CUPS": CUPS_MAPPING.get(cup, cup),
+                            "Xarxa (kWh)": val_grid,
+                            "Autoconsum (kWh)": val_self,
+                            "Demanda Total (kWh)": total_demand,
+                            "% Autarquia": autarchy_pct
+                        })
+                        
+                        total_grid_kwh += val_grid
+                        total_self_kwh += val_self
+                        
+                    # Community Totals
+                    comm_demand = total_grid_kwh + total_self_kwh
+                    comm_autarchy = (total_self_kwh / comm_demand * 100) if comm_demand > 0 else 0
+                    
+                    # --- KPIs ---
+                    st.subheader("Balanç Global de la Comunitat (Total Participants)")
+                    k1, k2, k3, k4 = st.columns(4)
+                    k1.metric("Demanda Total Comunitat", f"{comm_demand:,.0f} kWh")
+                    k2.metric("Generació Autoconsumida", f"{total_self_kwh:,.0f} kWh")
+                    k3.metric("Importat Xarxa", f"{total_grid_kwh:,.0f} kWh")
+                    k4.metric("% Autarquia Mitjana", f"{comm_autarchy:.1f}%")
+                    
+                    st.markdown("---")
+                    
+                    # --- Visualizations ---
+                    # Prepare time series
+                    ts_grid = pd.Series(0.0, index=df_filtered_t1.index)
+                    ts_self = pd.Series(0.0, index=df_filtered_t1.index)
+                    
+                    for cup in self_consumption_cups:
+                         cols = df[cup].columns
+                         ae_col = [c for c in cols if 'AE' in c and 'kWh' in c and 'AUTOCONS' not in c]
+                         auto_col = [c for c in cols if 'AE' in c and 'kWh' in c and 'AUTOCONS' in c]
+                         
+                         if ae_col: ts_grid = ts_grid.add(df_filtered_t1[cup][ae_col[0]], fill_value=0)
+                         if auto_col: ts_self = ts_self.add(df_filtered_t1[cup][auto_col[0]], fill_value=0)
+                    
+                    # Resample for Chart
+                    days = (df_filtered_t1.index.max() - df_filtered_t1.index.min()).days
+                    freq = '1d' if days < 60 else '1W' if days < 365 else 'ME'
+                    
+                    chart_grid = ts_grid.resample(freq).sum()
+                    chart_self = ts_self.resample(freq).sum()
+                    chart_autarchy = (chart_self / (chart_grid + chart_self) * 100).fillna(0)
+                    
+                    c1, c2 = st.columns([2, 1])
+                    
+                    with c1:
+                        st.markdown("##### ⚡ Evolució Mix Energètic (Comunitat)")
+                        fig_bal = go.Figure()
+                        fig_bal.add_trace(go.Bar(x=chart_grid.index, y=chart_self, name='Autoconsum', marker_color='gold'))
+                        fig_bal.add_trace(go.Bar(x=chart_grid.index, y=chart_grid, name='Xarxa', marker_color='gray'))
+                        fig_bal.update_layout(barmode='stack', xaxis_title="Temps", yaxis_title="kWh", legend=dict(orientation="h", y=1.1))
+                        st.plotly_chart(fig_bal, use_container_width=True)
+                        
+                        st.markdown("##### 📈 Evolució Autarquia (%)")
+                        fig_aut = px.line(x=chart_autarchy.index, y=chart_autarchy.values, markers=True)
+                        fig_aut.update_traces(line_color='green')
+                        fig_aut.update_layout(xaxis_title="Temps", yaxis_title="% Autarquia")
+                        st.plotly_chart(fig_aut, use_container_width=True)
+                        
+                    with c2:
+                        st.markdown("##### 🍰 Quota Autoconsum per Participant")
+                        df_summ = pd.DataFrame(data_summary)
+                        if not df_summ.empty:
+                            fig_pie = px.pie(df_summ, values='Autoconsum (kWh)', names='CUPS', hole=0.4)
+                            st.plotly_chart(fig_pie, use_container_width=True)
+
+                    st.markdown("---")
+                    st.subheader("Detall per Participant")
+                    st.dataframe(
+                        df_summ.style.format({
+                            "Xarxa (kWh)": "{:,.0f}", 
+                            "Autoconsum (kWh)": "{:,.0f}", 
+                            "Demanda Total (kWh)": "{:,.0f}",
+                            "% Autarquia": "{:.1f}%"
+                        })
+                    )
+
 if __name__ == "__main__":
     main()
