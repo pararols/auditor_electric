@@ -426,10 +426,19 @@ def render_executive_report(df, lighting_cups, building_cups, all_cups):
     st.markdown("---")
     st.subheader("☀️ Impacte Comunitat Energètica Local")
     
-    # Identify self-consumers existing in the DF
-    self_cups = detect_self_consumption_cups(df)
-    # Filter for Community Participants only
-    self_cups = [c for c in self_cups if c in COMMUNITY_PARTICIPANTS]
+    # Identify self-consumers using Whitelist Only (User Request)
+    # Note: DF columns are Names (mapped), Whitelist is CUPS IDs. We must reverse map.
+    rev_map = {v: k for k, v in CUPS_MAPPING.items()}
+    clean_whitelist = [x.strip().upper() for x in COMMUNITY_PARTICIPANTS]
+    
+    all_cols = df.columns.get_level_values(0).unique()
+    self_cups = []
+    
+    for c in all_cols:
+        # Get Original CUPS ID from Name if possible, else use Name
+        original_id = rev_map.get(c, c) 
+        if str(original_id).strip().upper() in clean_whitelist:
+            self_cups.append(c)
     
     if not self_cups:
         st.info("No s'han detectat dades d'autoconsum en aquests anys.")
@@ -530,7 +539,18 @@ def main():
             # --- Classification Step ---
             st.subheader("🤖 Classificació Automàtica de CUPS")
             lighting_cups, building_cups = classify_cups_by_name(df)
-            self_consumption_cups = detect_self_consumption_cups(df) # New detection
+            # Identify self-consumers from Whitelist directly
+            # DF columns are Names, Whitelist is IDs. Reverse map needed.
+            rev_map_local = {v: k for k, v in CUPS_MAPPING.items()}
+            clean_whitelist = [x.strip().upper() for x in COMMUNITY_PARTICIPANTS]
+            
+            all_cols_idx = df.columns.get_level_values(0).unique()
+            self_consumption_cups = []
+            for c in all_cols_idx:
+                cid = rev_map_local.get(c, c)
+                if str(cid).strip().upper() in clean_whitelist:
+                    self_consumption_cups.append(c)
+            
             all_cups = df.columns.get_level_values(0).unique().tolist()
             
             # Show Classification Logic Results
@@ -1447,8 +1467,17 @@ def main():
             with tab5:
                 st.header("☀️ Autoconsum i Comunitat Energètica")
                 
-                # Filter for Community Participants Only
-                self_consumption_cups = [c for c in self_consumption_cups if c in COMMUNITY_PARTICIPANTS]
+                # Identify self-consumers from Whitelist directly
+                # DF columns are Names, Whitelist is IDs. Reverse map needed.
+                rev_map_local = {v: k for k, v in CUPS_MAPPING.items()}
+                clean_whitelist = [x.strip().upper() for x in COMMUNITY_PARTICIPANTS]
+                
+                all_cols_idx = df.columns.get_level_values(0).unique()
+                self_consumption_cups = []
+                for c in all_cols_idx:
+                    cid = rev_map_local.get(c, c)
+                    if str(cid).strip().upper() in clean_whitelist:
+                        self_consumption_cups.append(c)
                 
                 if not self_consumption_cups:
                     st.info("No s'han detectat punts de la Comunitat Energètica amb dades d'autoconsum.")
