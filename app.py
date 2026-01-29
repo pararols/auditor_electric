@@ -190,51 +190,24 @@ def parse_data(uploaded_file):
         st.error(f"Error parsing file: {e}")
         return None
 
-def classify_supply_points(df):
+def classify_cups_by_name(df):
     """
-    Classifies CUPS into 'Building' or 'Public Lighting' based on Daytime Ratio.
-    Public Lighting: Daytime Ratio < 5% (0.05)
+    Classifies CUPS into 'Building' or 'Public Lighting' based on Name.
+    Public Lighting: Starts with 'Enll' (case insensitive).
     """
-    # Extract CUPS (Level 0 of column MultiIndex)
     cups_list = df.columns.get_level_values(0).unique()
     
-    classification_results = []
+    lighting = []
+    buildings = []
     
     for cups in cups_list:
-        # Get active energy for this CUPS
-        # Need to allow for case where AE_kWh might differ slightly in naming or case
-        # We look for columns containing 'AE' and 'kWh' in the second level for this CUPS
-        subset = df[cups]
-        # Try to find the Active Energy column
-        ae_col = [c for c in subset.columns if 'AE' in c and 'kWh' in c]
-        
-        if not ae_col:
-            continue
-            
-        ae_series = subset[ae_col[0]]
-        
-        # Calculate daily total
-        total_kwh = ae_series.sum()
-        
-        # Calculate Daytime consumption (11:00 to 15:00)
-        # Filter by hour
-        daytime_mask = (ae_series.index.hour >= 11) & (ae_series.index.hour < 15)
-        daytime_kwh = ae_series[daytime_mask].sum()
-        
-        if total_kwh > 0:
-            ratio = daytime_kwh / total_kwh
+        # Check if name starts with 'Enll'
+        if str(cups).lower().startswith("enll"):
+            lighting.append(cups)
         else:
-            ratio = 0
+            buildings.append(cups)
             
-        is_lighting = ratio < 0.05
-        
-        classification_results.append({
-            "CUPS": cups,
-            "Daytime Ratio": ratio,
-            "Is Public Lighting": is_lighting
-        })
-        
-    return pd.DataFrame(classification_results)
+    return lighting, buildings
 
 # --- New Helper: Date Navigator ---
 def get_date_range(view_mode, anchor_date):
@@ -315,35 +288,51 @@ def main():
             if not (min_csv_date <= st.session_state.anchor_date <= max_csv_date):
                  st.session_state.anchor_date = min_csv_date
 
-            # --- Classification Step ---
+            # --- Classification Step (Name Based) ---
             st.subheader("🤖 Classificació Automàtica de CUPS")
-            classification_df = classify_supply_points(df)
-            
-            # User override (Sidebar or Expander to save space)
-            with st.expander("Veure/Editar Classificació"):
-                edited_classification = st.data_editor(
-                    classification_df,
-                    column_config={
-                        "Is Public Lighting": st.column_config.CheckboxColumn(
-                            "És Enllumenat Públic?",
-                            default=False,
-                        ),
-                        "Daytime Ratio": st.column_config.ProgressColumn(
-                            "Rati Diürn (11h-15h)",
-                            format="%.2f%%",
-                            min_value=0,
-                            max_value=1,
-                        )
-                    },
-                    disabled=["CUPS", "Daytime Ratio"],
-                    hide_index=True,
-                    use_container_width=True
-                )
-            
-            # Lists
-            lighting_cups = edited_classification[edited_classification["Is Public Lighting"]]["CUPS"].tolist()
-            building_cups = edited_classification[~edited_classification["Is Public Lighting"]]["CUPS"].tolist()
+            lighting_cups, building_cups = classify_cups_by_name(df)
             all_cups = df.columns.get_level_values(0).unique().tolist()
+            
+            # Show Classification Logic Results
+            with st.expander("Veure Detall Classificació (Enllumenat vs Edificis)", expanded=True):
+                col_class_1, col_class_2 = st.columns(2)
+                
+                # Reverse Map for Display
+                rev_map = {v: k for k, v in CUPS_MAPPING.items()}
+                
+                def make_display_df(items):
+                    rows = []
+                    for it in items:
+                        # it is the name in the DF (Mapped or Raw)
+                        real_cups = rev_map.get(it, it) # Get key if it was a value, else it
+                        # If mapped, it is key -> value. So if 'it' is 'Can Burcet', rev is CUPS. 
+                        # If 'it' is CUPS (notmapped), rev_map.get(it) is None usually unless identity.
+                        # Wait, CUPS_MAPPING is ID -> Name. 
+                        # 'it' is Name (if mapped) or ID (if not).
+                        # If 'it' is Name, we want ID.
+                        
+                        # Check if 'it' is in values of map
+                        found_key = None
+                        for k, v in CUPS_MAPPING.items():
+                            if v == it:
+                                found_key = k
+                                break
+                        
+                        if found_key:
+                             display_cups = found_key
+                        else:
+                             display_cups = it # Likely the ID itself
+                             
+                        rows.append({"Nom Assignat": it, "CUPS Original": display_cups})
+                    return pd.DataFrame(rows)
+                
+                with col_class_1:
+                    st.markdown(f"**💡 Enllumenat ({len(lighting_cups)})**")
+                    st.dataframe(make_display_df(lighting_cups), hide_index=True, use_container_width=True)
+                    
+                with col_class_2:
+                    st.markdown(f"**🏢 Edificis / Altres ({len(building_cups)})**")
+                    st.dataframe(make_display_df(building_cups), hide_index=True, use_container_width=True)
             
             # --- Global Filter Logic Helpers ---
             def set_cups_selection(group_type):
@@ -731,6 +720,39 @@ def main():
                                 data_matrix.append(row_dict)
                             
                             st.dataframe(pd.DataFrame(data_matrix))
+                            
+                            # Bar Chart Visualization of the Summary
+                            st.caption("Visualització Gràfica del Resum Anual")
+                            fig_summ_bar = go.Figure()
+                            
+                            # We want Grouped Bar Chart: X=Series, Group=Year
+                            # Iterate Years to create Traces
+                            for y in selected_years_comp:
+                                y_values = []
+                                for row in data_matrix:
+                                    # row has "Sèrie", "2023", "2024"...
+                                    val_str = row.get(str(y), "0")
+                                    val = float(val_str)
+                                    y_values.append(val)
+                                
+                                x_names = [row["Sèrie"] for row in data_matrix]
+                                
+                                fig_summ_bar.add_trace(go.Bar(
+                                    x=x_names,
+                                    y=y_values,
+                                    name=str(y),
+                                    text=[f"{v:.0f}" for v in y_values],
+                                    textposition='auto'
+                                ))
+                            
+                            fig_summ_bar.update_layout(
+                                barmode='group',
+                                title="Comparativa de Totals per Sèrie i Any",
+                                yaxis_title="kWh",
+                                xaxis_title="Sèries",
+                                legend_title="Any"
+                            )
+                            st.plotly_chart(fig_summ_bar, use_container_width=True)
                 else:
                     st.info("Selecciona almenys una sèrie per visualitzar.")
 
