@@ -258,16 +258,159 @@ def shift_date(view_mode, anchor_date, direction):
 
 # --- Main App Interface ---
 
+# --- Executive Report Mode ---
+def render_executive_report(df, lighting_cups, building_cups, all_cups):
+    st.header("📋 Informe Executiu Anual")
+    
+    # 1. Year Selection
+    years = sorted(df.index.year.unique())
+    if len(years) < 2:
+        st.warning("Es necessiten almenys 2 anys de dades per generar l'informe comparatiu.")
+        target_year = years[0] if years else datetime.date.today().year
+        prev_year = target_year - 1
+    else:
+        col_y1, col_y2 = st.columns(2)
+        target_year = col_y1.selectbox("Any d'Anàlisi", years, index=len(years)-1)
+        prev_year_options = [y for y in years if y != target_year]
+        prev_year = col_y2.selectbox("Any de Comparació", prev_year_options, index=len(prev_year_options)-1 if prev_year_options else 0)
+
+    # 2. Data Preparation
+    df_target = df[df.index.year == target_year]
+    df_prev = df[df.index.year == prev_year]
+    
+    # Helper for sum
+    def get_sum(dframe, subset_cups):
+        if dframe.empty: return 0
+        total = 0
+        for c in subset_cups:
+            if c in dframe.columns:
+                # Find AE column
+                cols = dframe[c].columns
+                ae = [x for x in cols if 'AE' in x and 'kWh' in x and 'AUTOCONS' not in x]
+                if ae:
+                    total += dframe[c][ae[0]].sum()
+        return total
+
+    total_target = get_sum(df_target, all_cups)
+    total_prev = get_sum(df_prev, all_cups)
+    
+    delta_val = total_target - total_prev
+    delta_pct = (delta_val / total_prev) * 100 if total_prev > 0 else 0
+    
+    # 3. High Level KPIs
+    st.subheader("Visió General")
+    col_kpi1, col_kpi2, col_kpi3 = st.columns(3)
+    
+    col_kpi1.metric(f"Consum Total {target_year}", f"{total_target:,.0f} kWh", delta=f"{delta_val:,.0f} kWh", delta_color="inverse")
+    col_kpi2.metric(f"Variació vs {prev_year}", f"{delta_pct:+.1f}%", delta=f"{delta_pct:+.1f}%", delta_color="inverse")
+    
+    light_target = get_sum(df_target, lighting_cups)
+    build_target = get_sum(df_target, building_cups)
+    
+    col_kpi3.metric(f"Enllumenat / Edificis ({target_year})", f"{light_target:,.0f} / {build_target:,.0f} kWh")
+    
+    # 4. Monthly Evolution
+    st.subheader(f"Evolució Mensual: {target_year} vs {prev_year}")
+    
+    # Helper Resample
+    def get_monthly_sum(dframe):
+        # We need to sum per month.
+        # Quickest: Resample entire DF (might be slow if huge), or iterate cups?
+        # Let's use the helper logic from parse logic if possible or just loop.
+        # Actually simplest: dframe.resample('ME').sum() aggregates all Cols.
+        # BUT columns are MultiIndex (CUPS, Var).
+        # We want to sum ALL AE columns.
+        if dframe.empty: return pd.Series(0, index=[])
+        
+        # Identify AE columns globally?
+        # Let's iterate cups to be safe and avoid non-numeric issues
+        total_s = pd.Series(0.0, index=dframe.resample('ME').sum().index)
+        for c in dframe.columns.get_level_values(0).unique():
+             cols = dframe[c].columns
+             ae = [x for x in cols if 'AE' in x and 'kWh' in x and 'AUTOCONS' not in x]
+             if ae:
+                 total_s = total_s.add(dframe[c][ae[0]].resample('ME').sum(), fill_value=0)
+        return total_s
+
+    s_monthly_target = get_monthly_sum(df_target)
+    s_monthly_prev = get_monthly_sum(df_prev)
+    
+    # Create Chart DF
+    df_chart = pd.DataFrame({"Mes": range(1, 13)})
+    # Fill values
+    def fill_vals(series, year):
+        vals = []
+        for m in range(1, 13):
+            # Check if month exists in series index
+            # Series index is Datetime
+            val = 0
+            # Filter series by month
+            subset = series[series.index.month == m]
+            if not subset.empty:
+                val = subset.sum() # Should be just one value if resampled ME
+            vals.append(val)
+        return vals
+
+    df_chart[f"{prev_year}"] = fill_vals(s_monthly_prev, prev_year)
+    df_chart[f"{target_year}"] = fill_vals(s_monthly_target, target_year)
+    
+    month_names = {1: 'Gen', 2: 'Feb', 3: 'Mar', 4: 'Abr', 5: 'Mai', 6: 'Jun', 
+                   7: 'Jul', 8: 'Ago', 9: 'Set', 10: 'Oct', 11: 'Nov', 12: 'Des'}
+    df_chart["NomMes"] = df_chart["Mes"].map(month_names)
+    
+    fig_bar = go.Figure()
+    fig_bar.add_trace(go.Bar(x=df_chart["NomMes"], y=df_chart[f"{prev_year}"], name=str(prev_year), marker_color='lightgrey'))
+    fig_bar.add_trace(go.Bar(x=df_chart["NomMes"], y=df_chart[f"{target_year}"], name=str(target_year), marker_color='#1f77b4'))
+    
+    fig_bar.update_layout(title="Comparativa Mensual", barmode='group')
+    st.plotly_chart(fig_bar, use_container_width=True)
+    
+    # 5. Top Movers
+    st.subheader("Rànquing de Variacions (Per CUPS)")
+    col_top1, col_top2 = st.columns(2)
+    
+    diffs = []
+    for cup in all_cups:
+        val_t = get_sum(df_target, [cup])
+        val_p = get_sum(df_prev, [cup])
+        
+        diff = val_t - val_p
+        pct = (diff / val_p * 100) if val_p > 0 else 0
+        name = CUPS_MAPPING.get(cup, cup)
+        diffs.append({"Nom": name, "Diferència (kWh)": diff, "Diferència (%)": pct})
+    
+    df_diffs = pd.DataFrame(diffs)
+    
+    with col_top1:
+        st.markdown("##### 📉 Top 5 Estalvis")
+        savings = df_diffs[df_diffs["Diferència (kWh)"] < 0].sort_values("Diferència (kWh)", ascending=True).head(5)
+        if not savings.empty:
+             st.table(savings.style.format({"Diferència (kWh)": "{:,.0f}", "Diferència (%)": "{:+.1f}%"}))
+        else:
+             st.info("Sense estalvis.")
+             
+    with col_top2:
+        st.markdown("##### 📈 Top 5 Augments")
+        increases = df_diffs[df_diffs["Diferència (kWh)"] > 0].sort_values("Diferència (kWh)", ascending=False).head(5)
+        if not increases.empty:
+             st.table(increases.style.format({"Diferència (kWh)": "{:,.0f}", "Diferència (%)": "{:+.1f}%"}))
+        else:
+             st.info("Sense augments.")
+
+    # 6. Detailed Table
+    st.subheader("Detall Mensual")
+    st.dataframe(df_chart.style.format({f"{target_year}": "{:,.0f}", f"{prev_year}": "{:,.0f}"}), use_container_width=True)
+
+
+# --- Main App Interface ---
+
 def main():
     st.title("💡 Auditor Energètic & Enllumenat Públic")
     
-    # Init Session State for Filters
-    if 'selected_cups_list' not in st.session_state:
-        st.session_state.selected_cups_list = []
-    if 'anchor_date' not in st.session_state:
-        st.session_state.anchor_date = datetime.date.today()
-    if 'view_mode' not in st.session_state:
-        st.session_state.view_mode = 'Mensual'
+    # Init Session State
+    if 'selected_cups_list' not in st.session_state: st.session_state.selected_cups_list = []
+    if 'anchor_date' not in st.session_state: st.session_state.anchor_date = datetime.date.today()
+    if 'view_mode' not in st.session_state: st.session_state.view_mode = 'Mensual'
 
     # Sidebar
     st.sidebar.header("Pujar Dades")
@@ -278,17 +421,13 @@ def main():
             df = parse_data(uploaded_file)
             
         if df is not None:
-            st.success("Dades carregades correctament!")
-            
-            # Use data range to initialize anchor if outside range
+            # Init anchor
             min_csv_date = df.index.min().date()
             max_csv_date = df.index.max().date()
-            
-            # Simple check to init anchor date inside range if it's currently outside
             if not (min_csv_date <= st.session_state.anchor_date <= max_csv_date):
                  st.session_state.anchor_date = min_csv_date
 
-            # --- Classification Step (Name Based) ---
+            # --- Classification Step ---
             st.subheader("🤖 Classificació Automàtica de CUPS")
             lighting_cups, building_cups = classify_cups_by_name(df)
             all_cups = df.columns.get_level_values(0).unique().tolist()
@@ -296,43 +435,37 @@ def main():
             # Show Classification Logic Results
             with st.expander("Veure Detall Classificació (Enllumenat vs Edificis)", expanded=True):
                 col_class_1, col_class_2 = st.columns(2)
+                # Reverse Map for Display works... (omitted detailed display code copy for brevity in replace, assuming prev block exists, but wait, I am replacing the block I just messed up)
+                # I need to be careful. The previous tool call messed up lines 337 to 394 in a weird way.
+                # I should just restore the Expanders display code here too if I'm replacing the whole Main start?
+                # No, the previous tool call FAILED to generate a valid replacement because of comments/pass use.
+                # The file content viewed in step 402 SHOWS the "pass" and weird lines.
+                # I must OVERWRITE the "pass" block with the new logic.
                 
-                # Reverse Map for Display
+                # Re-implementing the Expander Logic (simplified)
                 rev_map = {v: k for k, v in CUPS_MAPPING.items()}
-                
                 def make_display_df(items):
                     rows = []
                     for it in items:
-                        # it is the name in the DF (Mapped or Raw)
-                        real_cups = rev_map.get(it, it) # Get key if it was a value, else it
-                        # If mapped, it is key -> value. So if 'it' is 'Can Burcet', rev is CUPS. 
-                        # If 'it' is CUPS (notmapped), rev_map.get(it) is None usually unless identity.
-                        # Wait, CUPS_MAPPING is ID -> Name. 
-                        # 'it' is Name (if mapped) or ID (if not).
-                        # If 'it' is Name, we want ID.
-                        
-                        # Check if 'it' is in values of map
-                        found_key = None
-                        for k, v in CUPS_MAPPING.items():
-                            if v == it:
-                                found_key = k
-                                break
-                        
-                        if found_key:
-                             display_cups = found_key
-                        else:
-                             display_cups = it # Likely the ID itself
-                             
-                        rows.append({"Nom Assignat": it, "CUPS Original": display_cups})
+                        rows.append({"Nom": it, "CUPS": rev_map.get(it, it)})
                     return pd.DataFrame(rows)
                 
                 with col_class_1:
                     st.markdown(f"**💡 Enllumenat ({len(lighting_cups)})**")
-                    st.dataframe(make_display_df(lighting_cups), hide_index=True, use_container_width=True)
-                    
+                    st.dataframe(make_display_df(lighting_cups), hide_index=True)
                 with col_class_2:
-                    st.markdown(f"**🏢 Edificis / Altres ({len(building_cups)})**")
-                    st.dataframe(make_display_df(building_cups), hide_index=True, use_container_width=True)
+                    st.markdown(f"**🏢 Edificis ({len(building_cups)})**")
+                    st.dataframe(make_display_df(building_cups), hide_index=True)
+            
+            # --- Mode Selection ---
+            st.sidebar.divider()
+            app_mode = st.sidebar.radio("Mode de Visualització", ["Expert", "Informe Executiu"], index=0)
+
+            if app_mode == "Informe Executiu":
+                render_executive_report(df, lighting_cups, building_cups, all_cups)
+                return 
+
+            # === MODE: EXPERT (Implicit, proceeds below) ===
             
             # --- Global Filter Logic Helpers ---
             def set_cups_selection(group_type):
