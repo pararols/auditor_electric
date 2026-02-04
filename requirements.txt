@@ -4,3 +4,4 @@ plotly
 astral
 openpyxl
 supabase
+requests
