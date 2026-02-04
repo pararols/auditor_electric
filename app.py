@@ -316,6 +316,10 @@ def sync_csv_to_db(df):
         subset_melted = subset.reset_index().melt(id_vars=['reading_time'], var_name='variable', value_name='value')
         subset_melted['cups'] = cup
         
+        # Drop duplicates if any (same reading_time and variable)
+        # Keep last (assuming later part of CSV is more correct if overlap)
+        subset_melted = subset_melted.drop_duplicates(subset=['reading_time', 'variable'], keep='last')
+        
         # Drop NaNs (missing data)
         subset_melted = subset_melted.dropna(subset=['value'])
         
