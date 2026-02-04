@@ -239,17 +239,63 @@ def load_from_supabase_db():
     """Fetch all readings and reconstruct DataFrame."""
     supabase = init_supabase()
     
-    # Needs efficient fetching. For demo, fetch all (limit may apply)
-    # Ideally fetch by chunks or date range.
-    try:
-        response = supabase.table("energy_readings").select("*").execute()
-        data = response.data
-    except Exception as e:
-        st.error(f"Error connectant a Supabase: {e}")
-        return None
+    # Fetch all data with Pagination (Chunking)
+    # Supabase API has a limit (usually 1000, max maybe higher).
+    # We must loop to get all 1.4M+ rows.
     
-    if not data:
+    all_data = []
+    chunk_size = 5000 # Try 5000. If timeout, reduce.
+    offset = 0
+    
+    status_text = st.empty()
+    progress_bar = st.progress(0)
+    
+    # We don't know exact count efficiently without separate query, 
+    # but we can loop until empty.
+    # Optional: Get count first for progress bar?
+    try:
+        count_res = supabase.table("energy_readings").select("*", count="exact", head=True).execute()
+        total_rows = count_res.count
+    except:
+        total_rows = 1 # Unknown
+    
+    status_text.text(f"Descarregant dades... (Total estimat: {total_rows} registres)")
+    
+    while True:
+        try:
+            # Range is inclusive? PostgREST range is inclusive.
+            response = supabase.table("energy_readings").select("*").range(offset, offset + chunk_size - 1).execute()
+            chunk = response.data
+            
+            if not chunk:
+                break
+                
+            all_data.extend(chunk)
+            
+            offset += len(chunk)
+            
+            # Progress update
+            if total_rows > 0:
+                prog = min(offset / total_rows, 1.0)
+                progress_bar.progress(prog)
+                status_text.text(f"Descarregant... {offset} / {total_rows} registres")
+            
+            # If we got less than requested, we are done
+            # BUT Supabase/PostgREST might hard-limit responses to 1000 even if we ask for 5000.
+            # So we should NOT break just because len(chunk) < chunk_size unless it's 0.
+            # Safest is to break only if empty (checked above: if not chunk: break).
+            pass # Continue loop until empty
+                
+        except Exception as e:
+            st.error(f"Error durant la descàrrega (offset {offset}): {e}")
+            break
+            
+    if not all_data:
         return None
+        
+    data = all_data
+    status_text.empty()
+    progress_bar.empty()
         
     # Convert to DataFrame
     df_raw = pd.DataFrame(data)
@@ -262,20 +308,46 @@ def load_from_supabase_db():
     # No, we want MultiIndex Columns.
     
     # Optimize: pivot_table
-    df_raw['reading_time'] = pd.to_datetime(df_raw['reading_time'])
+    # Use coerce to handle any potential parsing errors
+    df_raw['reading_time'] = pd.to_datetime(df_raw['reading_time'], errors='coerce')
+    
+    # CRITICAL FIX: Convert to Naive Datetime (Wall Clock) to match original CSV behavior
+    if df_raw['reading_time'].dt.tz is not None:
+         df_raw['reading_time'] = df_raw['reading_time'].dt.tz_localize(None)
     
     # Pivot
     # index='reading_time', columns=['cups', 'variable'], values='value'
     df_pivot = df_raw.pivot_table(index='reading_time', columns=['cups', 'variable'], values='value', aggfunc='first')
     
+    # Fill NAs with 0 (consistency with parse_data)
+    df_pivot = df_pivot.fillna(0)
+    
     # Ensure index is sorted
     df_pivot.sort_index(inplace=True)
+    df_pivot.index = pd.to_datetime(df_pivot.index) # RE-ENFORCE format
+    df_pivot.index.name = 'Datetime'
+    
+    # Remove Level Names to match Parse Data structure exactly
+    df_pivot.columns.names = [None, None]
     
     return df_pivot
 
-def sync_csv_to_db(df):
-    """Uploads a parsed DataFrame to Supabase."""
+def sync_csv_to_db(df, mode="merge"):
+    """
+    Uploads a parsed DataFrame to Supabase.
+    mode: 'merge' (upsert), 'replace' (delete all then insert)
+    """
     supabase = init_supabase()
+    
+    if mode == "replace":
+        st.warning("⚠️ Esborrant totes les dades existents a Supabase...")
+        try:
+            # Use RPC function for fast truncation (avoids timeout)
+            supabase.rpc("truncate_energy_readings", {}).execute()
+            st.success("Base de dades buidada correctament.")
+        except Exception as e:
+            st.error(f"Error esborrant dades: {e}")
+            return
     
     # Convert DataFrame to Tidy Format (Long)
     # df has MultiIndex Columns (CUPS, Variable)
@@ -703,8 +775,17 @@ def main():
                  df = parse_data(uploaded_file)
              
              if df is not None:
-                 if st.sidebar.button("💾 Guardar a Base de Dades"):
-                     sync_csv_to_db(df)
+                 st.write("---")
+                 st.markdown("##### ☁️ Configuració de Càrrega")
+                 upload_mode = st.radio(
+                     "Mode de Sincronització", 
+                     ["Fusionar / Actualitzar", "⚠️ Esborrar Tot i Reemplaçar"],
+                     help="Fusionar: Actualitza dades existents i afegeix les noves. \nEsborrar: Elimina TOTA la base de dades abans de carregar aquest fitxer."
+                 )
+                 
+                 if st.button("💾 Guardar a Base de Dades"):
+                     mode_code = "replace" if "Esborrar" in upload_mode else "merge"
+                     sync_csv_to_db(df, mode=mode_code)
                      
     else: # Database Mode
         with st.spinner("Descarregant dades del núvol..."):
