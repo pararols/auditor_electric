@@ -213,6 +213,129 @@ def parse_data(uploaded_file):
         st.error(f"Error parsing file: {e}")
         return None
 
+# --- New Helper: Edistribucion Raw Importer ---
+def process_edistribucion_files(uploaded_files):
+    """
+    Parses and merges multiple raw Edistribucion CSVs.
+    Logic ported from React App:
+    - Normalizes hours (1-24 -> 0-23 if needed).
+    - Merges by CUPS and Timestamp.
+    - Output: DataFrame with MultiIndex Columns (CUPS, Variable) and Datetime Index.
+    """
+    all_records = []
+    
+    progress_text = st.empty()
+    progress_bar = st.progress(0)
+    
+    for i, file in enumerate(uploaded_files):
+        progress_text.text(f"Processant {file.name}...")
+        try:
+            # Read CSV
+            # Edistribucion format: ; separator, , decimal
+            # Encoding often ISO-8859-1 or mbcs on Windows
+            df = pd.read_csv(file, sep=';', encoding='latin-1', dtype=str)
+            
+            # Check required columns
+            required = ['CUPS', 'Fecha', 'Hora', 'AE_kWh']
+            if not all(col in df.columns for col in required):
+                st.warning(f"Saltant {file.name}: Falten columnes requerides.")
+                continue
+                
+            # Normalize Hours
+            # Check range
+            hours = pd.to_numeric(df['Hora'], errors='coerce')
+            min_h = hours.min()
+            max_h = hours.max()
+            
+            # Logic from React: If no 0 and (has 24 OR min is 1), shift -1
+            has_zero = (hours == 0).any()
+            has_24 = (hours == 24).any()
+            
+            if not has_zero and (has_24 or min_h == 1):
+                df['Hora'] = hours - 1
+            else:
+                df['Hora'] = hours
+                
+            # Create Timestamp
+            # Fecha format usually DD/MM/YYYY
+            # Hora is 0..23 integer
+            
+            # Vectorized Date Parsing
+            # Combine Date + Hour -> "DD/MM/YYYY HH:00"
+            df['datetime_str'] = df['Fecha'] + ' ' + df['Hora'].astype(str).str.pad(2, fillchar='0') + ':00'
+            df['reading_time'] = pd.to_datetime(df['datetime_str'], format='%d/%m/%Y %H:%M', errors='coerce')
+            
+            # Extract relevant columns
+            # AE_AUTOCONS_kWh equivalent
+            # Sometimes called 'AE_AUTOCONS_kWh' or similar. 
+            # In types.ts it was AE_AUTOCONS_kWh.
+            
+            # We want to extract [Time, CUPS, AE, Autocons]
+            # And add to a mega list to pivot later
+            
+            # Normalize numeric
+            df['AE_kWh'] = df['AE_kWh'].str.replace('.', '', regex=False).str.replace(',', '.')
+            df['AE_kWh'] = pd.to_numeric(df['AE_kWh'], errors='coerce').fillna(0)
+            
+            if 'AE_AUTOCONS_kWh' in df.columns:
+                 df['AE_AUTOCONS_kWh'] = df['AE_AUTOCONS_kWh'].str.replace('.', '', regex=False).str.replace(',', '.')
+                 df['AE_AUTOCONS_kWh'] = pd.to_numeric(df['AE_AUTOCONS_kWh'], errors='coerce').fillna(0)
+            else:
+                 df['AE_AUTOCONS_kWh'] = 0
+            
+            # Keep only valid times
+            df = df.dropna(subset=['reading_time'])
+            
+            # Store necessary columns
+            # Need strict reference to CUPS from file
+            # If CUPS column is constant in file (usually is), take first valid
+            cups_raw = df['CUPS'].iloc[0] if not df.empty else "UNKNOWN"
+            # Apply Mapping (ID -> Name) to ensure consistency with legacy data
+            cups_file = CUPS_MAPPING.get(cups_raw, cups_raw)
+            
+            # We append sub-dataframes to list
+            subset = df[['reading_time', 'AE_kWh', 'AE_AUTOCONS_kWh']].copy()
+            subset['CUPS'] = cups_file
+            
+            all_records.append(subset)
+            
+        except Exception as e:
+            st.error(f"Error processant {file.name}: {e}")
+            
+        progress_bar.progress((i + 1) / len(uploaded_files))
+            
+    progress_text.empty()
+    progress_bar.empty()
+    
+    if not all_records:
+        return None
+        
+    # Concatenate all
+    big_df = pd.concat(all_records, ignore_index=True)
+    
+    # Pivot to Wide Format (Time x CUPS_Variable)
+    # We want columns: (CUPS, 'AE_kWh'), (CUPS, 'AE_AUTOCONS_kWh')
+    
+    # Melt first? No, pure pivot.
+    # Pivot table supports multiple values columns
+    pivot = big_df.pivot_table(index='reading_time', columns='CUPS', values=['AE_kWh', 'AE_AUTOCONS_kWh'], aggfunc='last')
+    
+    # Pivot creates columns MultiIndex: (Variable, CUPS) -> ('AE_kWh', 'ES...')
+    # We want (CUPS, Variable) -> ('ES...', 'AE_kWh')
+    pivot.columns = pivot.columns.swaplevel(0, 1)
+    pivot.columns.names = [None, None] # Clean names
+    
+    # Sort columns
+    pivot.sort_index(axis=1, inplace=True)
+    
+    # Index name
+    pivot.index.name = 'Datetime'
+    
+    # Fill NAs
+    pivot = pivot.fillna(0)
+    
+    return pivot
+
 # --- Supabase Helpers ---
 
 def login_form():
@@ -291,6 +414,9 @@ def load_from_supabase_db():
     # 3. Join back
     df_final = pd.concat([meta_df, data_df], axis=1)
     
+    # Fill Missing Values with 0 (for new rows that don't have all cups)
+    df_final = df_final.fillna(0)
+    
     # 4. Handle DateTime
     df_final['reading_time'] = pd.to_datetime(df_final['reading_time'], errors='coerce')
     if df_final['reading_time'].dt.tz is not None:
@@ -312,10 +438,16 @@ def load_from_supabase_db():
         
         parts = col.split("___")
         if len(parts) == 2:
-            new_cols.append((parts[0], parts[1]))
+            cups_id = parts[0]
+            variable = parts[1]
+            # Map ID -> Name
+            cups_name = CUPS_MAPPING.get(cups_id, cups_id)
+            new_cols.append((cups_name, variable))
         else:
             # Fallback
-            new_cols.append(("Unknown", col))
+            original_id = col
+            mapped_name = CUPS_MAPPING.get(original_id, original_id)
+            new_cols.append(("Unknown", mapped_name))
             
     df_final.columns = pd.MultiIndex.from_tuples(new_cols)
     df_final.columns.names = [None, None]
@@ -327,14 +459,15 @@ def load_from_supabase_db():
 def sync_csv_to_db(df, mode="merge"):
     """
     Uploads using Optimized Wide Format (JSONB).
-    mode: 'merge' (upsert), 'replace' (truncate then insert)
+    mode: 'merge' (smart merge via RPC), 'replace' (truncate then insert)
     """
     supabase = init_supabase()
     
     if mode == "replace":
         st.warning("⚠️ Esborrant dades existents...")
         try:
-            supabase.table("energy_readings_wide").delete().gt("reading_time", "1900-01-01").execute()
+            # Use RPC for fast truncation (avoid timeout on large table)
+            supabase.rpc("truncate_energy_readings", {}).execute()
             st.success("Buidatge complet.")
         except Exception as e:
             st.error(f"Error esborrant: {e}")
@@ -392,7 +525,12 @@ def sync_csv_to_db(df, mode="merge"):
     for k in range(0, len(final_payload), chunk_size):
         chunk = final_payload[k:k+chunk_size]
         try:
-            supabase.table("energy_readings_wide").upsert(chunk, on_conflict='reading_time').execute()
+            if mode == "replace":
+                # Standard Upsert is faster/simpler for Replace (fresh table)
+                supabase.table("energy_readings_wide").upsert(chunk, on_conflict='reading_time').execute()
+            else:
+                # Merge Mode: Use Custom RPC to merge JSONB (partial updates)
+                supabase.rpc("merge_readings", {"payload": chunk}).execute()
             
             prog = min((k + len(chunk)) / total_rows, 1.0)
             progress_bar.progress(prog)
@@ -752,12 +890,12 @@ def main():
     st.sidebar.divider()
     
     # Data Source Selection
-    source_mode = st.sidebar.radio("Font de Dades", ["Base de Dades (Supabase)", "Pujar CSV Local"], index=0)
+    source_mode = st.sidebar.radio("Font de Dades", ["Base de Dades (Supabase)", "Pujar CSV Local (Processat)", "Importar Edistribucion (Originals)"], index=0)
     
     df = None
     
-    if source_mode == "Pujar CSV Local":
-        uploaded_file = st.sidebar.file_uploader("Pujar CSV (Format Horari)", type=["csv"])
+    if source_mode == "Pujar CSV Local (Processat)":
+        uploaded_file = st.sidebar.file_uploader("Pujar CSV (Format Horari)", type=["csv"], help="Format: Datetime Index, Columnes=CUPS")
         if uploaded_file is not None:
              with st.spinner('Processant CSV...'):
                  df = parse_data(uploaded_file)
@@ -772,6 +910,43 @@ def main():
                  )
                  
                  if st.button("💾 Guardar a Base de Dades"):
+                     mode_code = "replace" if "Esborrar" in upload_mode else "merge"
+                     sync_csv_to_db(df, mode=mode_code)
+                     
+    elif source_mode == "Importar Edistribucion (Originals)":
+        st.sidebar.info("Puja fitxers originals (.csv) d'Edistribucion. S'agruparan i normalitzaran automàticament.")
+        uploaded_files = st.sidebar.file_uploader("Pujar CSVs Originals", type=["csv"], accept_multiple_files=True)
+        
+        if uploaded_files:
+            if st.sidebar.button("⚙️ Processar i Previsualitzar"):
+                 with st.spinner("Processant i fusionant fitxers..."):
+                     df = process_edistribucion_files(uploaded_files)
+                     if df is not None:
+                         st.success(f"Processats {len(uploaded_files)} fitxers correctament!")
+            
+            # If we simply want to process AND load, maybe we do it in one step or persistent state?
+            # Streamlit re-runs, so df will be lost unless stored.
+            # Let's simple approach: If files present, process immediately on load or allow button?
+            # Better UI: Process immediately to show preview (Parse is fast enough for small batches).
+            if not st.session_state.get('edist_processed', False):
+                 # Auto-process if not heavy? 
+                 # Let's do it on the fly to populate 'df' variable so the rest of the app shows the preview.
+                 with st.spinner("Llegint fitxers..."):
+                     df = process_edistribucion_files(uploaded_files)
+            
+            if df is not None:
+                 st.write("---")
+                 st.markdown("##### ☁️ Configuració de Càrrega")
+                 st.info(f"Dades preparades: {len(df)} hores x {len(df.columns)//2} CUPS")
+                 
+                 upload_mode = st.radio(
+                     "Mode de Sincronització", 
+                     ["Fusionar / Actualitzar", "⚠️ Esborrar Tot i Reemplaçar"],
+                     key="upload_mode_edist",
+                     help="Fusionar: Recomanat per afegir nous mesos."
+                 )
+                 
+                 if st.button("💾 Guardar a Base de Dades (Edistribucion)"):
                      mode_code = "replace" if "Esborrar" in upload_mode else "merge"
                      sync_csv_to_db(df, mode=mode_code)
                      
