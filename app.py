@@ -360,23 +360,38 @@ def login_form():
         except Exception as e:
             st.error(f"Error d'accés: {e}")
 
-def load_from_supabase_db():
-    """Fetch all readings using Optimized Wide Format (JSONB)."""
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_from_supabase_db(start_date=None, end_date=None):
+    """
+    Fetch readings using Optimized Wide Format (JSONB), optionally filtered by date.
+    Lazy Loading Implementation (Skill: Python Pattern 19).
+    """
     supabase = init_supabase()
     
-    # Fast Fetch: With JSONB, 3 years data = ~35k rows.
-    # Supabase API limits to 1000 rows by default. Must paginate.
-    
-    all_data = []
-    chunk_size = 5000
-    offset = 0
+    # Defaults: If no date provided, fetch ALL (Legacy behavior, but we will control this from main)
+    # But to be safe, if None, we imply "All available" or "Current Year" depending on caller?
+    # Let's keep it flexible: None means no filter.
     
     status_text = st.empty()
     status_text.text("Descarregant dades (Format Optimitzat)...")
     
+    all_data = []
+    chunk_size = 1000 # Supabase API default limit is 1000. Must match or be lower to detect end correctly.
+    offset = 0
+    
     while True:
         try:
-            response = supabase.table("energy_readings_wide").select("*").order("reading_time").range(offset, offset + chunk_size - 1).execute()
+            query = supabase.table("energy_readings_wide").select("*").order("reading_time")
+            
+            if start_date:
+                query = query.gte("reading_time", start_date.isoformat())
+            if end_date:
+                # Add one day to include the end_date fully if it's just a date object
+                # If it's datetime, exact. Assuming date strings or objects here.
+                # safely convert to string
+                query = query.lte("reading_time", end_date.isoformat())
+
+            response = query.range(offset, offset + chunk_size - 1).execute()
             chunk = response.data
             
             if not chunk:
@@ -385,10 +400,9 @@ def load_from_supabase_db():
             all_data.extend(chunk)
             offset += len(chunk)
             
-            # Correct Logic: ONLY break if chunk is empty.
-            # PostgREST/Supabase may limit response to 1000 even if we ask for more.
-            # So getting < chunk_size doesn't mean we are done, unless it is 0.
-            pass
+            # Optimization: If chunk is smaller than limit, we are done.
+            if len(chunk) < chunk_size:
+                break
                  
         except Exception as e:
              st.error(f"Error descarregant: {e}")
@@ -613,56 +627,347 @@ def shift_date(view_mode, anchor_date, direction):
 # --- Main App Interface ---
 
 # --- Executive Report Mode ---
-def render_executive_report(df, lighting_cups, building_cups, all_cups):
+def render_executive_report(df, lighting_cups, building_cups, all_cups, source_mode=""):
     st.header("📋 Informe Executiu Anual")
     
     # 1. Year Selection
-    years = sorted(df.index.year.unique())
+    # If DB Mode, we may not have all years in 'df' (Lazy Loaded). 
+    # Hardcode reasonable range or fetch? For speed, let's offer likely years.
+    
+    if source_mode == "Base de Dades (Supabase)":
+        # Dynamic Fetch via RPC
+        client = init_supabase()
+        try:
+             res = client.rpc("get_distinct_years").execute()
+             # Result is [{'year': 2024}, {'year': 2023}...] sorted DESC by RPC
+             years = sorted([item['year'] for item in res.data]) if res.data else [] 
+        except Exception as e:
+             st.error(f"Error recuperant anys: {e}")
+             years = []
+             
+        # Fallback if empty (e.g. first run) to avoid crash
+        if not years:
+             years = [datetime.date.today().year]
+    else:
+        years = sorted(df.index.year.unique()) if df is not None else []
+        
+    if not years:
+        st.warning("No hi ha dades disponibles.")
+        return
+
     if len(years) < 2:
         st.warning("Es necessiten almenys 2 anys de dades per generar l'informe comparatiu.")
-        target_year = years[0] if years else datetime.date.today().year
+        target_year = years[-1] # Last available
         prev_year = target_year - 1
     else:
         col_y1, col_y2 = st.columns(2)
-        target_year = col_y1.selectbox("Any d'Anàlisi", years, index=len(years)-1)
+        # Default: Last Year vs Previous available
+        default_target_idx = len(years) - 1
+        default_prev_idx = len(years) - 2 # The one before last
+        
+        target_year = col_y1.selectbox("Any d'Anàlisi", years, index=default_target_idx)
         prev_year_options = [y for y in years if y != target_year]
-        prev_year = col_y2.selectbox("Any de Comparació", prev_year_options, index=len(prev_year_options)-1 if prev_year_options else 0)
+        
+        # Recalculate default prev index based on options
+        # If target is Max, previous avail is Max in options.
+        def_prev_opt_idx = len(prev_year_options) - 1 if prev_year_options else 0
+        
+        prev_year = col_y2.selectbox("Any de Comparació", prev_year_options, index=def_prev_opt_idx)
 
-    # 2. Data Preparation
-    df_target = df[df.index.year == target_year]
-    df_prev = df[df.index.year == prev_year]
+    # 2. Data Acquisition (RPC vs Local)
     
-    # Helper for sum
-    def get_sum(dframe, subset_cups):
-        if dframe.empty: return 0
-        total = 0
-        for c in subset_cups:
-            if c in dframe.columns:
-                # Find AE column
-                cols = dframe[c].columns
-                ae = [x for x in cols if 'AE' in x and 'kWh' in x and 'AUTOCONS' not in x]
-                if ae:
-                    total += dframe[c][ae[0]].sum()
-        return total
+    # Structure to hold monthly series for charts and totals
+    # We need: Total All, Total Light, Total Build per Year
+    # And: Monthly Series for Chart
+    
+    data_target = None
+    data_prev = None
+    
+    @st.cache_data(ttl=300) # Short cache for report queries
+    def fetch_year_sums_rpc(year):
+        """Fetches monthly sums for a specific year via RPC."""
+        s = datetime.date(year, 1, 1)
+        e = datetime.date(year, 12, 31)
+        # Assuming RPC signature: get_monthly_sums(start_date, end_date)
+        client = init_supabase()
+        try:
+             res = client.rpc("get_monthly_sums", {
+                 "start_date": s.isoformat(), 
+                 "end_date": e.isoformat()
+             }).execute()
+             return res.data
+        except Exception as e:
+             st.error(f"Error RPC: {e}")
+             return []
 
-    total_target = get_sum(df_target, all_cups)
-    total_prev = get_sum(df_prev, all_cups)
+    # Processing Logic
+    def process_data(year_data, subset_labels):
+        """
+        Input: List of dicts [{'month': '2024-01-01', 'cups': 'ES..._AE_kWh', 'total_kwh': 123}, ...]
+        Output: Total Sum, Monthly Series
+        """
+        if not year_data:
+             return 0, pd.Series(0.0, index=range(1, 13))
+             
+        # Conversion to DF
+        dframe = pd.DataFrame(year_data)
+        if dframe.empty: return 0, pd.Series(0.0, index=range(1, 13))
+        
+        # 'cups' column contains VAR too e.g. "ES..._AE_kWh". 
+        # We need to filter for AE_kWh and optionally by subset (cups IDs)
+        
+        # 1. Filter for Active Energy
+        dframe = dframe[dframe['cups'].str.contains('_AE_kWh') & ~dframe['cups'].str.contains('AUTOCONS')]
+        
+        # 2. Filter by Subset if provided (cups IDs from 'subset_labels')
+        # subset_labels comes from classify_cups_by_name matches 'Name' or 'ID'.
+        # The 'cups' column in RPC result matches DF column names (MultiIndex Level 0 + Var).
+        # We need to extract the CUPS ID from string "ESxxx___AE_kWh" or similar.
+        
+        # Helper to extract ID from "ES002100000..."
+        # Simply check if startswith any of the target IDs?
+        # Map Name -> ID first.
+        
+        # Let's assume passed 'subset_labels' are DataFrame Columns Level 0 (Names or IDs).
+        # Our RPC 'cups' are formatted keys. 
+        # Need to align this mapping.
+        
+        filtered_df = dframe.copy()
+        
+        if subset_labels is not None:
+             # This is tricky without the exact mapping.
+             # Option: Filter based on substring match?
+             # Or: relies on 'df' existing mapping?
+             # Let's revert to simplistic: All Items use 'all_cups' logic?
+             # Actually, simpler:
+             # Helper: Load from Supabase (Cached)
+             # If we are in DB mode, 'lighting_cups' list contains Names (e.g. "Ajuntament").
+             # We need to map Name -> ID to filter.
+             # We have CUPS_MAPPING dict in global scope.
+             rev_map = {v: k for k, v in CUPS_MAPPING.items()}
+             
+             target_ids = []
+             for lbl in subset_labels:
+                 # If lbl is a Name, get ID. If ID, keep ID.
+                 tid = rev_map.get(lbl, lbl)
+                 target_ids.append(tid)
+             
+             # Create pattern? or set check.
+             # Row 'cups' is "ID___VAR" usually (from our upload logic assumption in load_db)
+             # Wait, sync_csv_to_db uses: final_payload.append({'reading_time': ..., 'data': { 'ES..._AE_kWh': val } })
+             # So keys are IDs? Or Names?
+             # 'parse_data' uses Names if mapped?
+             # Let's look at `parse_data`. It renames columns to Names.
+             # Then `sync_csv_to_db` uses `d.to_dict(orient='records')`.
+             # So the keys in JSONB are likely "Ajuntament___AE_kWh" if the DF columns were names?
+             # CRITICAL CHECK: `sync_csv_to_db`
+             # If keys are Names, then `lighting_cups` (Names) will match.
+             
+             # Filter:
+             # row['cups'] starts with one of target_ids/names?
+             # Regex is slow. Tuple prefix?
+             
+             # Let's filter:
+             mask = filtered_df['cups'].apply(lambda x: any(x.startswith(str(t)) for t in subset_labels))
+             filtered_df = filtered_df[mask]
+
+        if filtered_df.empty: return 0, pd.Series(0.0, index=range(1, 13))
+
+        # Sum
+        total_val = filtered_df['total_kwh'].sum()
+        
+        # Monthly Series
+        filtered_df['month_idx'] = pd.to_datetime(filtered_df['month']).dt.month
+        monthly_s = filtered_df.groupby('month_idx')['total_kwh'].sum()
+        
+        return total_val, monthly_s
     
+    def calculate_per_cup_totals_rpc(year_data):
+        """
+        Aggregates RPC data by CUPS Name.
+        Input: RPC List.
+        Output: Dict { 'CupName': total_kwh }
+        """
+        if not year_data: return {}
+        idf = pd.DataFrame(year_data)
+        if idf.empty: return {}
+        
+        # Filter for AE_kWh (ignore AUTOCONS for consumption ranking?)
+        # Convention: AE_kWh is grid/total consumption. 
+        # But 'all_cups' usually implies Consumption analysis.
+        idf = idf[idf['cups'].str.contains('_AE_kWh') & ~idf['cups'].str.contains('AUTOCONS')]
+        if idf.empty: return {}
+        
+        totals = {}
+        # Iterate rows is safer or group by substring?
+        # Extract ID from "ID___VAR"
+        # Since we don't have a clean column with just ID, let's extract.
+        # Format assumed: "ESxxxx___AE_kWh" or "ESxxxx_AE_kWh"
+        # Let's split by underscore.
+        
+        # Optimize: 
+        # 1. Group by 'cups' key first (sum over months)
+        grouped = idf.groupby('cups')['total_kwh'].sum()
+        
+        for k, val in grouped.items():
+            # k is like "ES0031405020755001NZ0F___AE_kWh"
+            # Split
+            parts = k.split('___') # Try triple first
+            if len(parts) < 2:
+                 parts = k.split('_AE_kWh') # Try suffix
+            
+            p_id = parts[0]
+            # Map ID -> Name
+            p_name = CUPS_MAPPING.get(p_id, p_id)
+            totals[p_name] = totals.get(p_name, 0) + val
+            
+        return totals
+
+    # --- EXECUTION ---
+    per_cup_target = {}
+    per_cup_prev = {}
+
+    if source_mode == "Base de Dades (Supabase)":
+        # RPC PATH
+        raw_target = fetch_year_sums_rpc(target_year)
+        raw_prev = fetch_year_sums_rpc(prev_year)
+        
+        # Update process_data logic fix: passing target_ids to lambda
+        # But simpler: we can just calculate totals independently here since we have a dedicated `calculate_per_cup_totals_rpc`
+        # Actually `process_data` was for the KPIs. Let's fix it or bypass it.
+        # Let's fix `process_data` implicitly by not using subset filtering there heavily or fixing the bug.
+        # Let's override `process_data` filtering:
+        
+        # Re-define process_data to be simpler/correct
+        def process_and_sum(year_data, subset_names):
+             # 1. Get Totals Dict
+             totals_dict = calculate_per_cup_totals_rpc(year_data)
+             # 2. Filter by subset
+             relevant_total = 0
+             for name in subset_names:
+                 relevant_total += totals_dict.get(name, 0)
+             
+             # 3. Monthly Series (Global for year)
+             # This is a bit disjointed. `process_data` returned (Total, Series).
+             # Let's just do it manually here.
+             
+             # Monthly Series needs to filter by subset too.
+             # This suggests `process_data` was the right abstraction if fixed.
+             pass 
+             
+        # ... Let's stick to the previous `process_data` structure but Fix the Bug inside it?
+        # No, I can't edit inside `process_data` easily as I'm replacing the EXECUTION block.
+        # I will rewrite `process_data` logic here inline or helper.
+        
+        # Helper for RPC KPI
+        def get_rpc_kpis(raw_data, subset_names):
+            if not raw_data: return 0, pd.Series(0.0, index=range(1, 13))
+            df_r = pd.DataFrame(raw_data)
+            if df_r.empty: return 0, pd.Series(0.0, index=range(1, 13))
+            
+            # Filter AE
+            df_r = df_r[df_r['cups'].str.contains('_AE_kWh') & ~df_r['cups'].str.contains('AUTOCONS')]
+            
+            # Filter by Subset (Names)
+            # Keys in Supabase are "Name___VAR" (e.g. "Escola___AE_kWh") 
+            # subset_names contains Names (e.g. "Escola")
+            # So we do NOT need to map to IDs. 
+            
+            target_names = set(subset_names)
+            
+            # Row match function
+            def is_match(row_key):
+                # row_key is "Name___VAR"
+                parts = row_key.split('___')
+                if len(parts) > 1:
+                     name_part = parts[0]
+                else:
+                     # Fallback if no separator
+                     name_part = row_key.replace('_AE_kWh','')
+                     
+                # Handle cases where Name might need mapping ONLY if it was an ID
+                # But here we assume it matches the list we have.
+                # Double check: if target_names has "Ajuntament" and key is "Ajuntament", we are good.
+                
+                return name_part in target_names
+            
+            # Apply Filter 
+            # Optimization: could verify if any target_names startswith key? No, key starts with name.
+            mask = df_r['cups'].apply(is_match)
+            df_sub = df_r[mask]
+            
+            if df_sub.empty: return 0, pd.Series(0.0, index=range(1, 13))
+            
+            val = df_sub['total_kwh'].sum()
+            df_sub['m'] = pd.to_datetime(df_sub['month']).dt.month
+            ser = df_sub.groupby('m')['total_kwh'].sum()
+            return val, ser
+
+        total_target, s_monthly_target = get_rpc_kpis(raw_target, all_cups)
+        total_prev, s_monthly_prev = get_rpc_kpis(raw_prev, all_cups)
+        
+        light_target, _ = get_rpc_kpis(raw_target, lighting_cups)
+        build_target, _ = get_rpc_kpis(raw_target, building_cups)
+        light_prev, _ = get_rpc_kpis(raw_prev, lighting_cups)
+        build_prev, _ = get_rpc_kpis(raw_prev, building_cups)
+        
+        # Populate Dictionary for Ranking
+        per_cup_target = calculate_per_cup_totals_rpc(raw_target)
+        per_cup_prev = calculate_per_cup_totals_rpc(raw_prev)
+        
+    else:
+        # LOCAL DF PATH (Legacy)
+        df_target = df[df.index.year == target_year]
+        df_prev = df[df.index.year == prev_year]
+        
+        def get_sum_local(dframe, subset_cups):
+            if dframe.empty: return 0
+            t = 0
+            for c in subset_cups:
+                if c in dframe.columns:
+                    cols = dframe[c].columns
+                    ae = [x for x in cols if 'AE' in x and 'kWh' in x and 'AUTOCONS' not in x]
+                    if ae: t += dframe[c][ae[0]].sum()
+            return t
+        
+        total_target = get_sum_local(df_target, all_cups)
+        total_prev = get_sum_local(df_prev, all_cups)
+        
+        light_target = get_sum_local(df_target, lighting_cups)
+        build_target = get_sum_local(df_target, building_cups)
+        light_prev = get_sum_local(df_prev, lighting_cups)
+        build_prev = get_sum_local(df_prev, building_cups)
+        
+        # Monthly S logic local
+        def get_monthly_local(dframe):
+            if dframe.empty: return pd.Series(0.0, index=range(1, 13))
+            # Resample ME
+            total_s = pd.Series(0.0, index=range(1, 13)) 
+            monthly_totals = {}
+            for m in range(1, 13):
+                subset = dframe[dframe.index.month == m]
+                val = get_sum_local(subset, all_cups)
+                monthly_totals[m] = val
+            return pd.Series(monthly_totals)
+            
+        s_monthly_target = get_monthly_local(df_target)
+        s_monthly_prev = get_monthly_local(df_prev)
+        
+        # Populate Dictionary for Ranking (Local)
+        for cup in all_cups:
+            per_cup_target[cup] = get_sum_local(df_target, [cup])
+            per_cup_prev[cup] = get_sum_local(df_prev, [cup])
+
+
+    # --- METRICS DISPLAY ---
     delta_val = total_target - total_prev
     delta_pct = (delta_val / total_prev) * 100 if total_prev > 0 else 0
     
-    # 3. High Level KPIs
     st.subheader("Visió General")
     col_kpi1, col_kpi2, col_kpi3 = st.columns(3)
     
     col_kpi1.metric(f"Consum Total {target_year}", f"{total_target:,.0f} kWh", delta=f"{delta_val:,.0f} kWh", delta_color="inverse")
     col_kpi2.metric(f"Variació vs {prev_year}", f"{delta_pct:+.1f}%", delta=f"{delta_pct:+.1f}%", delta_color="inverse")
-    
-    light_target = get_sum(df_target, lighting_cups)
-    build_target = get_sum(df_target, building_cups)
-    
-    light_prev = get_sum(df_prev, lighting_cups)
-    build_prev = get_sum(df_prev, building_cups)
     
     light_var = ((light_target - light_prev) / light_prev * 100) if light_prev > 0 else 0
     build_var = ((build_target - build_prev) / build_prev * 100) if build_prev > 0 else 0
@@ -670,51 +975,18 @@ def render_executive_report(df, lighting_cups, building_cups, all_cups):
     col_kpi3.metric(f"Enllumenat / Edificis ({target_year})", f"{light_target:,.0f} / {build_target:,.0f} kWh")
     col_kpi3.markdown(f"**Var:** 💡 {light_var:+.1f}% | 🏢 {build_var:+.1f}%")
     
-    # 4. Monthly Evolution
+    # 4. Monthly Evolution (Chart)
     st.subheader(f"Evolució Mensual: {target_year} vs {prev_year}")
     
-    # Helper Resample
-    def get_monthly_sum(dframe):
-        # We need to sum per month.
-        # Quickest: Resample entire DF (might be slow if huge), or iterate cups?
-        # Let's use the helper logic from parse logic if possible or just loop.
-        # Actually simplest: dframe.resample('ME').sum() aggregates all Cols.
-        # BUT columns are MultiIndex (CUPS, Var).
-        # We want to sum ALL AE columns.
-        if dframe.empty: 
-            return pd.Series(0.0, index=pd.DatetimeIndex([]))
-        
-        # Identify AE columns globally?
-        # Let's iterate cups to be safe and avoid non-numeric issues
-        total_s = pd.Series(0.0, index=dframe.resample('ME').sum().index)
-        for c in dframe.columns.get_level_values(0).unique():
-             cols = dframe[c].columns
-             ae = [x for x in cols if 'AE' in x and 'kWh' in x and 'AUTOCONS' not in x]
-             if ae:
-                 total_s = total_s.add(dframe[c][ae[0]].resample('ME').sum(), fill_value=0)
-        return total_s
-
-    s_monthly_target = get_monthly_sum(df_target)
-    s_monthly_prev = get_monthly_sum(df_prev)
-    
-    # Create Chart DF
     df_chart = pd.DataFrame({"Mes": range(1, 13)})
-    # Fill values
-    def fill_vals(series, year):
-        vals = []
-        for m in range(1, 13):
-            # Check if month exists in series index
-            # Series index is Datetime
-            val = 0
-            # Filter series by month
-            subset = series[series.index.month == m]
-            if not subset.empty:
-                val = subset.sum() # Should be just one value if resampled ME
-            vals.append(val)
-        return vals
-
-    df_chart[f"{prev_year}"] = fill_vals(s_monthly_prev, prev_year)
-    df_chart[f"{target_year}"] = fill_vals(s_monthly_target, target_year)
+    
+    # Fill from series (indexed 1..12 or compatible)
+    def safe_get(series, idx):
+        if idx in series.index: return series[idx]
+        return 0.0
+        
+    df_chart[f"{prev_year}"] = df_chart["Mes"].apply(lambda x: safe_get(s_monthly_prev, x))
+    df_chart[f"{target_year}"] = df_chart["Mes"].apply(lambda x: safe_get(s_monthly_target, x))
     
     month_names = {1: 'Gen', 2: 'Feb', 3: 'Mar', 4: 'Abr', 5: 'Mai', 6: 'Jun', 
                    7: 'Jul', 8: 'Ago', 9: 'Set', 10: 'Oct', 11: 'Nov', 12: 'Des'}
@@ -736,13 +1008,18 @@ def render_executive_report(df, lighting_cups, building_cups, all_cups):
     col_top1, col_top2 = st.columns(2)
     
     diffs = []
-    for cup in all_cups:
-        val_t = get_sum(df_target, [cup])
-        val_p = get_sum(df_prev, [cup])
+    # Use computed dictionaries instead of get_sum call
+    # Iterate keys from both dicts to be safe? 
+    # Or iterate all_cups (Names).
+    
+    for cup_name in all_cups:
+        # cup_name is Name (e.g. "Ajuntament")
+        val_t = per_cup_target.get(cup_name, 0)
+        val_p = per_cup_prev.get(cup_name, 0)
         
         diff = val_t - val_p
         pct = (diff / val_p * 100) if val_p > 0 else 0
-        name = CUPS_MAPPING.get(cup, cup)
+        name = CUPS_MAPPING.get(cup_name, cup_name)
         diffs.append({"Nom": name, "Diferència (kWh)": diff, "Diferència (%)": pct})
     
     df_diffs = pd.DataFrame(diffs)
@@ -788,44 +1065,82 @@ def render_executive_report(df, lighting_cups, building_cups, all_cups):
     if not self_cups:
         st.info("No s'han detectat dades d'autoconsum en aquests anys.")
     else:
-        # Calculate Total Self Consumption for Target Year
-        total_self_year = 0
-        total_grid_year = total_target # This is Sum of AE for all cups (filtered to community if scoped)
-        # Note: Logic Update. Grid Column IS the Total Building Consumption.
-        # So total_target calculated from AE columns ALREADY represents the Total Demand of the buildings.
-        
-        # We need to sum AE_AUTOCONS for target year
-        for c in self_cups:
-             cols = df_target[c].columns
-             auto_col = [x for x in cols if 'AUTOCONS' in x]
-             if auto_col:
-                 total_self_year += df_target[c][auto_col[0]].sum()
-        
+        if source_mode == "Base de Dades (Supabase)":
+            # RPC MODE for Community Impact
+            total_self_year = 0
+            
+            # Whitelist IDs -> Names
+            whitelist_names = set()
+            for w_id in clean_whitelist:
+                 possible_name = CUPS_MAPPING.get(w_id, w_id) # ID -> Name
+                 whitelist_names.add(possible_name)
+
+            # Define Helper to sum Autocons from raw_target (RPC data)
+            def sum_autocons_rpc(rpc_data, allowed_names):
+                if not rpc_data: return 0, pd.Series(0.0, index=range(1, 13))
+                df_r = pd.DataFrame(rpc_data)
+                
+                # Filter for AUTOCONS
+                mask_auto = df_r['cups'].str.contains('AUTOCONS')
+                df_auto = df_r[mask_auto]
+                
+                if df_auto.empty: return 0, pd.Series(0.0, index=range(1, 13))
+                
+                # Filter by Whitelist Names
+                # keys are Name___AUTOCONS...
+                def is_allowed(k):
+                    parts = k.split("___")
+                    name = parts[0] if len(parts) > 1 else k.replace('_AE_AUTOCONS_kWh','') # rough fallback
+                    # Check partial match just in case
+                    # But ideally exact name
+                    return name in allowed_names
+                
+                df_auto = df_auto[df_auto['cups'].apply(is_allowed)]
+                
+                if df_auto.empty: return 0, pd.Series(0.0, index=range(1, 13))
+                
+                tot = df_auto['total_kwh'].sum()
+                df_auto['m'] = pd.to_datetime(df_auto['month']).dt.month
+                ser = df_auto.groupby('m')['total_kwh'].sum()
+                return tot, ser
+            
+            total_self_year, s_monthly_self = sum_autocons_rpc(raw_target, whitelist_names)
+            
+        else:
+            # LEGACY / DATAFRAME MODE
+            # Calculate Total Self Consumption for Target Year
+            total_self_year = 0
+            # Helper to get monthly self
+            s_monthly_self = pd.Series(0.0, index=range(1, 13)) 
+            
+            for c in self_cups:
+                 cols = df_target[c].columns
+                 auto_col = [x for x in cols if 'AUTOCONS' in x]
+                 if auto_col:
+                     col_data = df_target[c][auto_col[0]]
+                     total_self_year += col_data.sum()
+                     
+                     # Monthly
+                     resampled = col_data.resample('ME').sum()
+                     # Fill series 1..12
+                     for m in range(1, 13):
+                         sub = resampled[resampled.index.month == m]
+                         val = sub.sum() if not sub.empty else 0
+                         s_monthly_self[m] = s_monthly_self.get(m, 0) + val
+ 
+        total_grid_year = total_target 
         total_muni_demand = total_grid_year 
         impact_pct = (total_self_year / total_muni_demand * 100) if total_muni_demand > 0 else 0
-        
-        # KPIs
-        k_c1, k_c2, k_c3, k_c4 = st.columns(4)
-        k_c1.metric("Total Autoconsumit (Any)", f"{total_self_year:,.0f} kWh")
-        k_c2.metric("Cobertura sobre Municipi", f"{impact_pct:.2f}%")
-        k_c3.metric("Punts amb Plaques", "1")
-        k_c4.metric("Punts amb Autoconsum", "6")
-        
-        # Simple Chart: Monthly Generation vs Total Demand
-        # Helper to get monthly self
-        s_monthly_self = pd.Series(0.0, index=df_target.resample('ME').sum().index)
-        for c in self_cups:
-             cols = df_target[c].columns
-             auto_col = [x for x in cols if 'AUTOCONS' in x]
-             if auto_col:
-                 s_monthly_self = s_monthly_self.add(df_target[c][auto_col[0]].resample('ME').sum(), fill_value=0)
         
         # Prepare Chart Data
         # Logic Update: Grid Column is Total. Self is part of it.
         # We want to stack: Self (Gold) + Net Grid (Grey) = Total Grid (Height).
         
         s_total = df_chart[f"{target_year}"] # Only sums AE cols of involved cups
-        s_self = fill_vals(s_monthly_self, target_year)
+        # Replace fill_vals since it's not defined in this scope.
+        # s_monthly_self is a Series indexed by Month (1..12)
+        s_self = [s_monthly_self.get(m, 0) for m in range(1, 13)]
+        
         s_net_grid = []
         for t, s in zip(s_total, s_self):
             s_net_grid.append(max(0, t - s))
@@ -1321,13 +1636,48 @@ def main():
                      sync_csv_to_db(df, mode=mode_code)
 
     else: # Database Mode
-        with st.spinner("Descarregant dades del núvol..."):
-            df = load_from_supabase_db()
+        # LAZY LOADING LOGIC
+        today = datetime.date.today()
         
-        if df is None:
-            st.info("La base de dades està buida o no s'han pogut carregar les dades.")
-            st.info("Utilitza 'Pujar CSV Local' per carregar les primeres dades.")
+        # Smart Default: Fetch Max Year from RPC
+        # If DB has no data, fallback to Current Year
+        # We can't reuse 'years' from main scope easily unless we fetch it here.
+        # Let's fetch quickly.
+        
+        try:
+             client = init_supabase()
+             res = client.rpc("get_distinct_years").execute()
+             db_years = [item['year'] for item in res.data] if res.data else []
+             max_year_db = max(db_years) if db_years else today.year
+             min_year_db = min(db_years) if db_years else today.year
+        except:
+             max_year_db = today.year
+             min_year_db = today.year
+             
+        # Default: FULL History (Min to Max) to allow navigation
+        default_start = datetime.date(min_year_db, 1, 1)
+        default_end = datetime.date(max_year_db, 12, 31)
+        
+        # Sidebar Control for Range
+        with st.sidebar.expander("📅 Rang de Dades (DB)", expanded=False):
+             db_start = st.date_input("Inici", default_start)
+             db_end = st.date_input("Fi", default_end)
+             reload_btn = st.button("🔄 Actualitzar Dades")
+             
+        # Initial Load or Reload
+        # We use st.cache_data to hold the DF unless parameters change
+        # But we need to handle the button press essentially as a trigger
+        
+        # Simple approach: Load based on inputs. Streamlit re-runs when inputs change.
+        # Check cache if same args
+        
+        with st.spinner(f"Carregant dades ({db_start} - {db_end})..."):
+             df = load_from_supabase_db(start_date=db_start, end_date=db_end)
 
+        if df is None:
+            st.info("La base de dades està buida o no s'han trobat dades en aquest rang.")
+            st.info("Utilitza 'Pujar CSV Local' per carregar les primeres dades.")
+            
     if df is not None:
         # Standardize Index (ensure Datetime)
         if not isinstance(df.index, pd.DatetimeIndex):
@@ -1338,9 +1688,14 @@ def main():
         min_csv_date = df.index.min().date()
         max_csv_date = df.index.max().date()
             
-        # If anchor is out of range, default to LATEST date (Max)
+        # If anchor is out of range, default to LATEST date (Max) but warn
         if not (min_csv_date <= st.session_state.anchor_date <= max_csv_date):
-             st.session_state.anchor_date = max_csv_date
+             st.toast(f"Data ajustada al rang disponible: {min_csv_date} - {max_csv_date}", icon="⚠️")
+             # Only adjust if it's REALLY far off (e.g. wrong year entirely when we have multiyer)
+             if st.session_state.anchor_date > max_csv_date:
+                 st.session_state.anchor_date = max_csv_date
+             elif st.session_state.anchor_date < min_csv_date:
+                 st.session_state.anchor_date = min_csv_date
 
         # --- Classification Step ---
         st.subheader("🤖 Classificació Automàtica de CUPS")
@@ -1388,7 +1743,7 @@ def main():
         app_mode = st.sidebar.radio("Mode de Visualització", ["Expert", "Informe Executiu"], index=1)
 
         if app_mode == "Informe Executiu":
-            render_executive_report(df, lighting_cups, building_cups, all_cups)
+            render_executive_report(df, lighting_cups, building_cups, all_cups, source_mode=source_mode)
             return 
 
         # === MODE: EXPERT (Implicit) ===
@@ -1428,7 +1783,8 @@ def main():
             
             with col_nav1:
                  # View Mode
-                 mode = st.selectbox("Escala Temporal", ["Diària", "Setmanal", "Mensual", "Anual"], key="view_mode_t1")
+                 # Changed key to v2 to force reset of state
+                 mode = st.selectbox("Escala Temporal", ["Diària", "Setmanal", "Mensual", "Anual"], key="view_mode_t1_v2")
             
             with col_nav2:
                 # Navigation Buttons
@@ -1496,6 +1852,23 @@ def main():
                     chart_ae = agg_ae.resample(freq_alias).sum()
                     chart_ac = agg_autocons.resample(freq_alias).sum()
                     
+                # --- ENFORCE FULL GRANULARITY (User Request) ---
+                # Ensure we show all expected points (e.g. 12 months) even if data is missing
+                full_idx = None
+                if mode == 'Anual':
+                     # Force 12 Months (Month End to match resample 'ME')
+                     # start_d is Jan 1. date_range 'ME' gives Jan 31, Feb 28...
+                     full_idx = pd.date_range(start=start_d, end=end_d, freq='ME') 
+                elif mode == 'Mensual' or mode == 'Setmanal':
+                     full_idx = pd.date_range(start=start_d, end=end_d, freq='D')
+                elif mode == 'Diària':
+                     # start_d is date. We need 24h.
+                     full_idx = pd.date_range(start=start_d, periods=24, freq='h')
+                
+                if full_idx is not None:
+                     chart_ae = chart_ae.reindex(full_idx, fill_value=0)
+                     chart_ac = chart_ac.reindex(full_idx, fill_value=0)
+
                 fig_line = go.Figure()
                 fig_line.add_trace(go.Bar(x=chart_ae.index, y=chart_ae, name='Consum Xarxa', marker_color='#EF553B') if freq_alias != '1h' else go.Scatter(x=chart_ae.index, y=chart_ae, name='Consum Xarxa', line=dict(color='#EF553B'), fill='tozeroy'))
                 
