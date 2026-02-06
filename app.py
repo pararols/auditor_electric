@@ -8,7 +8,7 @@ import datetime
 from datetime import timedelta
 import numpy as np
 from supabase import create_client, Client
-from huawei_client import HuaweiClient
+
 import time
 
 # --- Supabase Config ---
@@ -56,6 +56,16 @@ CUPS_MAPPING = {
     "ES0031408691405001KF0F": "Can Burcet",
 }
 
+# --- Global Configuration ---
+month_names = {
+    1: 'Gener', 2: 'Febrer', 3: 'Març', 4: 'Abril', 5: 'Maig', 6: 'Juny',
+    7: 'Juliol', 8: 'Agost', 9: 'Setembre', 10: 'Octubre', 11: 'Novembre', 12: 'Desembre'
+}
+month_names_short = {
+    1: 'Gen', 2: 'Feb', 3: 'Mar', 4: 'Abr', 5: 'Mai', 6: 'Jun', 
+    7: 'Jul', 8: 'Ago', 9: 'Set', 10: 'Oct', 11: 'Nov', 12: 'Des'
+}
+
 # --- Community Participants Whitelist ---
 COMMUNITY_PARTICIPANTS = [
     "ES0031406053357001QG0F", # Sala Nova
@@ -87,6 +97,43 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # --- Helper Functions ---
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_fv_data_chunked(start_date=None, end_date=None, chunk_size=1000):
+    """
+    Fetches FV_Sala_Nova data using pagination to bypass row limits.
+    If dates provided, filters by range.
+    GLOBAL HELPER.
+    """
+    all_rows = []
+    offset = 0
+    client = init_supabase()
+    
+    while True:
+        # Construct Query
+        q = client.table("FV_Sala_Nova").select("*").order("reading_time")
+        
+        if start_date:
+            q = q.filter("reading_time", "gte", start_date)
+        if end_date:
+            q = q.filter("reading_time", "lte", end_date)
+            
+        res = q.range(offset, offset + chunk_size - 1).execute()
+        
+        if not res.data:
+            break
+            
+        all_rows.extend(res.data)
+        
+        if len(res.data) < chunk_size:
+            break # Last page
+            
+        offset += chunk_size
+        
+        # Safety brake
+        if offset > 100000: break
+        
+    return all_rows
 
 def parse_data(uploaded_file):
     """
@@ -700,6 +747,8 @@ def render_executive_report(df, lighting_cups, building_cups, all_cups, source_m
              st.error(f"Error RPC: {e}")
              return []
 
+
+
     # Processing Logic
     def process_data(year_data, subset_labels):
         """
@@ -988,9 +1037,7 @@ def render_executive_report(df, lighting_cups, building_cups, all_cups, source_m
     df_chart[f"{prev_year}"] = df_chart["Mes"].apply(lambda x: safe_get(s_monthly_prev, x))
     df_chart[f"{target_year}"] = df_chart["Mes"].apply(lambda x: safe_get(s_monthly_target, x))
     
-    month_names = {1: 'Gen', 2: 'Feb', 3: 'Mar', 4: 'Abr', 5: 'Mai', 6: 'Jun', 
-                   7: 'Jul', 8: 'Ago', 9: 'Set', 10: 'Oct', 11: 'Nov', 12: 'Des'}
-    df_chart["NomMes"] = df_chart["Mes"].map(month_names)
+    df_chart["NomMes"] = df_chart["Mes"].map(month_names_short)
     
     fig_bar = go.Figure()
     fig_bar.add_trace(go.Bar(x=df_chart["NomMes"], y=df_chart[f"{prev_year}"], name=str(prev_year), marker_color='lightgrey'))
@@ -1196,57 +1243,145 @@ def render_executive_report(df, lighting_cups, building_cups, all_cups, source_m
             "% Autoconsum": "{:.1f}%"
         }))
 
-    # 8. Sala Nova PV Summary (Database)
+    # 8. Sala Nova PV Summary (Database) - Refactored
     st.markdown("---")
-    st.header("☀️ Resum Fotovoltaica (Sala Nova)")
+    st.header("Producció Fotovoltaica Sala Nova")
     
     try:
-        supa_client_rep = init_supabase()
-        resp_fv = supa_client_rep.table("FV_Sala_Nova").select("*").order("date").execute()
+        # Fetch FULL History robustly (chunked)
+        data_fv = fetch_fv_data_chunked(chunk_size=1000)
         
-        if resp_fv.data:
-            df_fv_rep = pd.DataFrame(resp_fv.data)
-            df_fv_rep['date'] = pd.to_datetime(df_fv_rep['date'])
-            df_fv_rep.set_index('date', inplace=True)
+        if data_fv:
+            df_fv_rep = pd.DataFrame(data_fv)
+            df_fv_rep['reading_time'] = pd.to_datetime(df_fv_rep['reading_time'])
+            df_fv_rep.set_index('reading_time', inplace=True)
             
-            # Filter Target Year
-            df_fv_target = df_fv_rep[df_fv_rep.index.year == target_year]
+            # --- KPIS ---
+            # 1. Total Historic
+            total_historic = df_fv_rep['potencia_fv'].sum()
             
-            if not df_fv_target.empty:
-                # KPIs
-                total_gen = df_fv_target['potencia_fv'].sum()
+            # 2. Target Year
+            df_target = df_fv_rep[df_fv_rep.index.year == target_year]
+            total_target_gen = df_target['potencia_fv'].sum() if not df_target.empty else 0
+            
+            # 3. Previous Year (for Variation)
+            df_prev = df_fv_rep[df_fv_rep.index.year == prev_year]
+            total_prev_gen = df_prev['potencia_fv'].sum() if not df_prev.empty else 0
+            
+            # Variation
+            delta_production = 0
+            if total_prev_gen > 0:
+                delta_production = ((total_target_gen - total_prev_gen) / total_prev_gen) * 100
                 
-                # Best Month
-                monthly_rep = df_fv_target['potencia_fv'].resample('ME').sum()
-                best_month_val = monthly_rep.max()
-                best_month_name = month_names.get(monthly_rep.idxmax().month, "-")
+            # 4. Best Month (Target Year)
+            monthly_target = df_target['potencia_fv'].resample('ME').sum() if not df_target.empty else pd.Series()
+            best_month_val = monthly_target.max() if not monthly_target.empty else 0
+            best_month_name = month_names.get(monthly_target.idxmax().month, "-") if not monthly_target.empty else "-"
+            
+            # 5. Savings
+            savings_kwh_price = 0.15 # Hardcoded assumption or config?
+            savings_target = total_target_gen * savings_kwh_price
+            savings_prev = total_prev_gen * savings_kwh_price
+            
+            delta_savings = 0
+            if savings_prev > 0:
+                delta_savings = ((savings_target - savings_prev) / savings_prev) * 100
                 
-                c_pv1, c_pv2, c_pv3 = st.columns(3)
-                c_pv1.metric(f"Generació Total {target_year}", f"{total_gen:,.0f} kWh")
-                c_pv2.metric("Millor Mes", f"{best_month_name}", f"{best_month_val:,.0f} kWh")
-                c_pv3.metric("Estalvi Estimat (@0.15€)", f"{total_gen * 0.15:,.2f} €")
+            # Display KPIs
+            c_k1, c_k2, c_k3, c_k4 = st.columns(4)
+            c_k1.metric("Total Històric", f"{total_historic:,.0f} kWh")
+            c_k2.metric(f"Producció {target_year}", f"{total_target_gen:,.0f} kWh", f"{delta_production:+.1f}% vs {prev_year}")
+            c_k3.metric(f"Millor Mes {target_year}", f"{best_month_name}", f"{best_month_val:,.0f} kWh")
+            c_k4.metric(f"Estalvi Any {target_year}", f"{savings_target:,.2f} €", f"{delta_savings:+.1f}% vs {prev_year}")
+            
+            # --- CHART: Comparative Evolution ---
+            if not df_target.empty or not df_prev.empty:
+                st.subheader(f"Comparativa Producció Mensual ({target_year} vs {prev_year})")
                 
-                # Chart
-                st.subheader(f"Producció Mensual {target_year}")
-                chart_data_fv = pd.DataFrame({"Mes": range(1, 13)})
+                # Monthly Aggregates
+                monthly_prev = df_prev['potencia_fv'].resample('ME').sum() if not df_prev.empty else pd.Series()
                 
-                def fill_fv(series):
-                    vals = []
-                    for m in range(1, 13):
-                        subset = series[series.index.month == m]
-                        vals.append(subset.sum() if not subset.empty else 0)
-                    return vals
+                # Align both to Month Numbers 1-12
+                # Helper to map 1..12
+                def map_to_months(series):
+                    out = pd.Series(0.0, index=range(1, 13))
+                    if series.empty: return out
+                    for ts, val in series.items():
+                        out[ts.month] = val
+                    return out
+                    
+                s_series_target = map_to_months(monthly_target)
+                s_series_prev = map_to_months(monthly_prev)
                 
-                chart_data_fv["kWh"] = fill_fv(monthly_rep)
-                chart_data_fv["NomMes"] = chart_data_fv["Mes"].map(month_names)
+                # Create DF for Plotly
+                months_label = [month_names.get(m, str(m)) for m in range(1, 13)]
                 
-                fig_fv_rep = go.Figure()
-                fig_fv_rep.add_trace(go.Bar(x=chart_data_fv["NomMes"], y=chart_data_fv["kWh"], marker_color='#FFC300', name='Generació'))
-                fig_fv_rep.update_layout(title="Generació FV Mensual", yaxis_title="kWh")
-                st.plotly_chart(fig_fv_rep, use_container_width=True)
+                fig_comp = go.Figure()
                 
+                # Previous Year (Line or Light Bar? Let's use Line for context or Bar group)
+                # User asked: "com el primer d'evolucio mensual que es compari entre 2 anys"
+                # The first chart (Executive) is Stacked Bar (Net + Self).
+                # Comparative usually implies Grouped Bar or Line + Bar.
+                # Let's use Grouped Bar for clear side-by-side.
+                
+                fig_comp.add_trace(go.Bar(
+                    x=months_label, 
+                    y=s_series_prev.values, 
+                    name=str(prev_year),
+                    marker_color='#d3d3d3' # Grey for past
+                ))
+                
+                fig_comp.add_trace(go.Bar(
+                    x=months_label, 
+                    y=s_series_target.values, 
+                    name=str(target_year),
+                    marker_color='#FFC300' # Gold for current
+                ))
+                
+                fig_comp.update_layout(
+                    title="Evolució Mensual Comparada",
+                    barmode='group', # Side by side
+                    yaxis_title="kWh",
+                    xaxis_title="Mes"
+                )
+                st.plotly_chart(fig_comp, use_container_width=True)
+                
+                # --- TABLE: Comparative Detail ---
+                st.markdown("##### 📄 Detall Producció Comparativa")
+                
+                tbl_rows = []
+                for m_idx in range(1, 13):
+                    m_label = month_names[m_idx]
+                    val_t = s_series_target[m_idx]
+                    val_p = s_series_prev[m_idx]
+                    
+                    diff = val_t - val_p
+                    diff_pct = (diff / val_p * 100) if val_p > 0 else 0
+                    
+                    tbl_rows.append({
+                        "Mes": m_label,
+                        f"{prev_year} (kWh)": val_p,
+                        f"{target_year} (kWh)": val_t,
+                        "Variació (%)": diff_pct
+                    })
+                    
+                # Total Row
+                tbl_rows.append({
+                    "Mes": "**TOTAL ANY**",
+                    f"{prev_year} (kWh)": total_prev_gen,
+                    f"{target_year} (kWh)": total_target_gen,
+                    "Variació (%)": delta_production
+                })
+                
+                df_tbl_comp = pd.DataFrame(tbl_rows)
+                st.table(df_tbl_comp.style.format({
+                    f"{prev_year} (kWh)": "{:,.0f}",
+                    f"{target_year} (kWh)": "{:,.0f}",
+                    "Variació (%)": "{:+.1f}%"
+                }))
             else:
-                st.info(f"No hi ha dades fotovoltaiques per l'any {target_year}.")
+                 st.info("No hi ha dades per generar la comparativa.")
+                 
         else:
             st.info("La base de dades FV és buida.")
             
@@ -1297,7 +1432,7 @@ def main():
     st.sidebar.divider()
     
     # Data Source Selection
-    source_mode = st.sidebar.radio("Font de Dades", ["Base de Dades (Supabase)", "Pujar CSV Local (Processat)", "Importar Edistribucion (Originals)", "Huawei FusionSolar (Núvol)"], index=0)
+    source_mode = st.sidebar.radio("Font de Dades", ["Base de Dades (Supabase)", "Pujar CSV Local (Processat)", "Importar Edistribucion (Originals)"], index=0)
     
     df = None
     
@@ -1358,346 +1493,7 @@ def main():
                      sync_csv_to_db(df, mode=mode_code)
                      
                      
-    elif source_mode == "Huawei FusionSolar (Núvol)":
-        st.sidebar.markdown("---")
-        st.sidebar.subheader("🔌 Connexió FusionSolar")
-        
-        # Session State for Huawei
-        if 'huawei_user' not in st.session_state: st.session_state.huawei_user = "SantJordiDesvalls"
-        if 'huawei_pass' not in st.session_state: st.session_state.huawei_pass = "SantJordi1"
-        if 'huawei_token' not in st.session_state: st.session_state.huawei_token = None
-        
-        h_user = st.sidebar.text_input("Usuari", value=st.session_state.huawei_user)
-        h_pass = st.sidebar.text_input("Contrasenya", value=st.session_state.huawei_pass, type="password")
-        
-        # Connection Logic
-        if st.sidebar.button("Connectar"):
-            with st.spinner("Connectant..."):
-                client = HuaweiClient(h_user, h_pass)
-                if client.login():
-                    st.session_state.huawei_token = client.token
-                    # Store cookies for session persistence
-                    st.session_state.huawei_cookies = client.session.cookies
-                    st.sidebar.success("Connectat!")
-                    st.rerun()
-                else:
-                    st.sidebar.error("Error de connexió (Revisa credencials).")
 
-        # Working Context
-        if st.session_state.huawei_token:
-            # Reconstruct Client
-            client = HuaweiClient(h_user, h_pass)
-            client.token = st.session_state.huawei_token
-            client.session.headers.update({"XSRF-TOKEN": client.token})
-            if 'huawei_cookies' in st.session_state:
-                client.session.cookies = st.session_state.huawei_cookies
-
-            # Fetch Stations if not ready
-            if 'huawei_stations' not in st.session_state:
-                 with st.spinner("Obtenint llista de plantes..."):
-                     stations = client.get_station_list()
-                     if stations:
-                         st.session_state.huawei_stations = stations
-                     else:
-                         st.sidebar.warning("No s'han trobat plantes o token caducat.")
-            
-            stations = st.session_state.get('huawei_stations', [])
-            if stations:
-                st.sidebar.markdown("---")
-                # Debug Info Expander
-                with st.sidebar.expander("ℹ️ Detalls Tècnics (Debug)"):
-                     st.json(stations)
-                     
-                station_opts = {s['stationName']: s['stationCode'] for s in stations}
-                station_name = st.selectbox("Seleccionar Planta", list(station_opts.keys()))
-                station_code = station_opts[station_name]
-                
-                # Test Connection Button
-                if st.sidebar.button("📡 Test Dades Temps Real"):
-                     with st.spinner("Connectant a inversor..."):
-                         rt_data = client.get_station_real_kpi(station_code)
-                         if rt_data:
-                             st.sidebar.success("Connexió de Dades Correcta!")
-                             st.sidebar.json(rt_data)
-                         else:
-                             st.sidebar.error("No s'han rebut dades (Potser l'inversor està apagat/nit?)")
-
-                st.write("---")
-                col_d1, col_d2 = st.columns(2)
-                d_start = col_d1.date_input("Data Inici", datetime.date.today() - timedelta(days=7))
-                d_end = col_d2.date_input("Data Fi", datetime.date.today())
-                
-                debug_mode = st.sidebar.checkbox("Mode Debug (Veure Logs en pantalla)")
-
-                # Buttons
-                col_btn1, col_btn2 = st.columns(2)
-                
-                # --- OPTION 1: DAILY DATA (FAST) ---
-                if col_btn1.button("📅 Importar Dades DIÀRIES (Ràpid)"):
-                     if d_start > d_end:
-                         st.error("⚠️ La Data Inici no pot ser posterior a la Data Fi.")
-                         st.stop()
-                     
-                     with st.spinner("Descarregant dades diàries..."):
-                         all_daily = []
-                         
-                         debug_container = st.expander("Logs de Càrrega (Diari)", expanded=True)
-
-                         # Logic Update: It seems get_kpi_station_day returns data for a RANGE or Month?
-                         # The log showed a list of many days for a single request. 
-                         # Let's try sending just the start date (or iterate by months if needed, but start simply).
-                         
-                         # Current implementation loop: 
-                         # We will stick to the loop but check if the FIRST request already gave us everything.
-                         # If so, we break the loop to save time.
-                         
-                         delta = d_end - d_start
-                         days_range = delta.days + 1
-                         
-                         # Set of collected dates to avoid duplicates
-                         collected_dates = set()
-                         
-                         progress_bar = st.progress(0)
-                         
-                         # Smart Loop: Check if we already have the data
-                         for i in range(days_range):
-                             current_d = d_start + timedelta(days=i)
-                             current_d_str = current_d.strftime("%Y-%m-%d")
-                             
-                             if current_d_str in collected_dates:
-                                 debug_container.write(f"Dia {current_d} ja descarregat (Saltant petició).")
-                                 progress_bar.progress((i + 1) / days_range)
-                                 time.sleep(0.05) # Tiny sleep for UI update
-                                 continue # Already got this day from a previous bulk response
-                             
-                             ts = int(datetime.datetime.combine(current_d, datetime.time(0,0)).timestamp() * 1000)
-                             
-                             debug_container.write(f"Petició API per dia: {current_d}...")
-                             data_day = client.get_kpi_station_day(station_code, ts)
-                             
-                             if data_day and isinstance(data_day, list):
-                                 # This gives us a list of days. Let's process ALL of them.
-                                 # This gives us a list of days. Let's process ALL of them.
-                                 debug_container.write(f"Rebuts {len(data_day)} registres.")
-                                 debug_container.json(data_day) # Show full JSON logs
-                                 
-                                 for item in data_day:
-                                     # Add to result
-                                     all_daily.append(item)
-                                     
-                                     # Mark this date as collected
-                                     try:
-                                         item_ts = item.get('collectTime')
-                                         if item_ts:
-                                             d_obj = datetime.datetime.fromtimestamp(item_ts/1000).date()
-                                             collected_dates.add(d_obj.strftime("%Y-%m-%d"))
-                                     except: pass
-                             else:
-                                 debug_container.error(f"Error o sense dades per dia {current_d}: {data_day}")
-                             
-                             progress_bar.progress((i + 1) / days_range)
-                             time.sleep(5.0) # Wait 5s between requests to avoiding 407 (Strict) 
-                             
-                         progress_bar.empty()
-                         
-                         if all_daily:
-                             rows = []
-                             for item in all_daily:
-                                  try:
-                                     dt = datetime.datetime.fromtimestamp(item['collectTime']/1000)
-                                     # For daily, power might be "inverter_power" or similar, need check
-                                     # API Document says 'inverter_power' for yield
-                                     val = 0.0
-                                     map_data = item.get('dataItemMap', {})
-                                     if 'inverter_power' in map_data:
-                                         val = float(map_data['inverter_power'])
-                                     elif 'productPower' in item: 
-                                         val = float(item['productPower'])
-                                     elif 'productPower' in map_data:
-                                         val = float(map_data['productPower'])
-                                         
-                                     rows.append({
-                                         'reading_time': dt,
-                                         'CUPS': station_name,
-                                         'AE_AUTOCONS_kWh': val,
-                                         'AE_kWh': 0
-                                     })
-                                  except: continue
-                             
-                             if rows:
-                                 df_huawei = pd.DataFrame(rows)
-                                 # Ensure datetime index is set correctly
-                                 if 'reading_time' in df_huawei.columns:
-                                     # Drop duplicates if any (same day fetched twice)
-                                     df_huawei = df_huawei.drop_duplicates(subset=['reading_time', 'CUPS'])
-                                 
-                                 # ... Standard processing for DF (Pivot etc) ...
-                                 pivot = df_huawei.pivot_table(index='reading_time', columns='CUPS', values=['AE_kWh', 'AE_AUTOCONS_kWh'], aggfunc='sum')
-                                 pivot.columns = pivot.columns.swaplevel(0, 1)
-                                 pivot.columns.names = [None, None]
-                                 pivot.sort_index(axis=1, inplace=True)
-                                 pivot.index.name = 'Datetime'
-                                 pivot = pivot.fillna(0)
-                                 df = pivot
-                                 st.success(f"Dades Diàries obtingudes: {len(df)} registres.")
-                                 
-                                 # --- AUTO-SAVE TO FV_SALA_NOVA ---
-                                 try:
-                                     # Prepare payload from rows (already parsed)
-                                     fv_payload = []
-                                     for r in rows:
-                                         # r has 'reading_time' (datetime), 'AE_AUTOCONS_kWh' (val)
-                                         d_str = r['reading_time'].strftime("%Y-%m-%d")
-                                         val_fv = r['AE_AUTOCONS_kWh']
-                                         fv_payload.append({"date": d_str, "potencia_fv": val_fv})
-                                     
-                                     if fv_payload:
-                                         supa_client = init_supabase()
-                                         supa_client.table("FV_Sala_Nova").upsert(fv_payload, on_conflict="date").execute()
-                                         st.toast(f"Guardats {len(fv_payload)} registres a FV_Sala_Nova", icon="💾")
-                                 except Exception as e:
-                                     st.error(f"Error guardant a DB Sala Nova: {e}")
-                                     
-                             else: st.warning("No s'han trobat dades diàries.")
-                         else: st.error("Error obtenint dades diàries.")
-
-                # --- OPTION 2: HOURLY DATA (SLOW) ---
-                if col_btn2.button("⏱️ Importar Dades HORÀRIES (Lent)"):
-                    if d_start > d_end:
-                         st.error("⚠️ La Data Inici no pot ser posterior a la Data Fi.")
-                         st.stop()
-                    stop_button = st.empty()
-                    is_stopped = False
-                    
-                    debug_container = st.expander("Logs de Càrrega (Horari)", expanded=True)
-                    
-                    with st.spinner("Descarregant dades horàries... (Lent per evitar Errors 407)"):
-                         # Stop Button Logic
-                         # Streamlit stop button is tricky inside loop without rerun.
-                         # We use a placeholder but user has to press 'Stop' in sidebar maybe?
-                         # Or just warn user: "Pot trigar minuts".
-                         
-                         all_hourly = []
-                         # Interval Loop
-                         delta = d_end - d_start
-                         days_range = delta.days + 1
-                         
-                         if days_range > 20:
-                             st.error(f"⚠️ Risc de Quota Diària: Has seleccionat {days_range} dies.")
-                             st.error("El límit diari de Huawei és de ~25 peticions. Si us plau, selecciona blocs de màxim 20 dies.")
-                             st.stop()
-                         
-                         progress_text = st.empty()
-                         progress_bar = st.progress(0)
-                         
-                         for i in range(days_range):
-                             current_d = d_start + timedelta(days=i)
-                             progress_text.text(f"Descarregant dia {current_d}...")
-                             
-                             # Optimization: get_kpi_station_hour returns 24h list for the day!
-                             ts = int(datetime.datetime.combine(current_d, datetime.time(0,0)).timestamp() * 1000)
-                             
-                             debug_container.write(f"Baixant hores del dia: {current_d}...")
-                             data_hour = client.get_kpi_station_hour(station_code, ts)
-                             
-                             if data_hour and isinstance(data_hour, list):
-                                 debug_container.write(f"Rebuts {len(data_hour)} registres horaris.")
-                                 for item in data_hour:
-                                      item['collectTime'] = item.get('collectTime', ts)
-                                      all_hourly.append(item)
-                                  
-                                 # --- IMMEDIATE SAVE LOGIC ---
-                                 try:
-                                     day_payload = []
-                                     for item in data_hour:
-                                          # Re-parse simple for DB
-                                           ms = item.get('collectTime', ts)
-                                           dt_item = datetime.datetime.fromtimestamp(ms/1000)
-                                           val = 0.0
-                                           map_data = item.get('dataItemMap', {})
-                                           if 'inverter_power' in map_data: val = float(map_data['inverter_power'])
-                                           elif 'productPower' in item: val = float(item['productPower'])
-                                           elif 'productPower' in map_data: val = float(map_data['productPower'])
-                                           
-                                           # Only save positive values? Or 0s too? 0s are valid (night).
-                                           day_payload.append({"date": dt_item.strftime("%Y-%m-%d %H:%M:%S"), "potencia_fv": val})
-                                      
-                                     if day_payload:
-                                          # Let's SUM the hourly data for this day to update the DAILY reading.
-                                          daily_sum_val = sum([x['potencia_fv'] for x in day_payload])
-                                          d_str_day = current_d.strftime("%Y-%m-%d")
-                                          
-                                          supa_client = init_supabase()
-                                          # Upsert Daily Total
-                                          supa_client.table("FV_Sala_Nova").upsert([{"date": d_str_day, "potencia_fv": daily_sum_val}], on_conflict="date").execute()
-                                          debug_container.success(f"Guardat DB: {d_str_day} ({daily_sum_val:.2f} kWh)")
-                                           
-                                 except Exception as e:
-                                     debug_container.error(f"Error guardant parcial DB: {e}")
-
-                             else:
-                                 debug_container.error(f"Error dia {current_d}: {data_hour}")
-                                      
-
-                             # 65s Delay to respect Rate Limit (1 req/min)
-                             # Show countdown
-                             if i < days_range - 1: # Don't wait after last day
-                                 for s in range(65, 0, -1):
-                                     progress_text.text(f"⏳ Esperant {s}s per límit API (Huawei 407)...")
-                                     time.sleep(1)
-                                 # time.sleep(65.0)
-                         
-                         progress_text.empty()
-                         progress_bar.empty()
-                         
-                         if all_hourly:
-                             # Process Data
-                             rows = []
-                             for item in all_hourly:
-                                 try:
-                                     # collectTime is ms
-                                     dt = datetime.datetime.fromtimestamp(item['collectTime']/1000)
-                                     
-                                     # Field mapping: 'inverter_power' is standard in dataItemMap for yield
-                                     val = 0.0
-                                     map_data = item.get('dataItemMap', {})
-                                     
-                                     if 'inverter_power' in map_data:
-                                          val = float(map_data['inverter_power'])
-                                     elif 'productPower' in item:
-                                          val = float(item['productPower'])
-                                     elif 'productPower' in map_data:
-                                          val = float(map_data['productPower'])
-                                     
-                                     rows.append({
-                                         'reading_time': dt,
-                                         'CUPS': station_name, # Map Plant Name to CUPS column
-                                         'AE_AUTOCONS_kWh': val,
-                                         'AE_kWh': 0 # We don't get grid import here usually
-                                     })
-                                 except:
-                                     continue
-                             
-                             if rows:
-                                 df_huawei = pd.DataFrame(rows)
-                                 # Format to App Standard
-                                 pivot = df_huawei.pivot_table(index='reading_time', columns='CUPS', values=['AE_kWh', 'AE_AUTOCONS_kWh'], aggfunc='sum')
-                                 pivot.columns = pivot.columns.swaplevel(0, 1) # (CUPS, Var)
-                                 pivot.columns.names = [None, None]
-                                 pivot.sort_index(axis=1, inplace=True)
-                                 pivot.index.name = 'Datetime'
-                                 pivot = pivot.fillna(0)
-                                 
-                                 df = pivot
-                                 st.success(f"Dades obtingudes: {len(df)} hores.")
-                             else:
-                                 st.warning("Dades buides després del processament.")
-                         else:
-                             st.warning("No s'han rebut dades del servidor.")
-
-            if df is not None:
-                 st.write("---")
-                 st.markdown("##### ☁️ Configuració de Càrrega")
                  st.dataframe(df.head())
                  
                  upload_mode = st.radio(
@@ -2893,37 +2689,211 @@ def main():
             st.header("☀️ Producció Fotovoltaica - Sala Nova (Base de Dades)")
             
             try:
+                # 1. Load Data
                 supa_client = init_supabase()
-                resp = supa_client.table("FV_Sala_Nova").select("*").order("date").execute()
-                data_fv = resp.data
+                # Use Global Chunked Helper
+                data_fv = fetch_fv_data_chunked(chunk_size=1000)
                 
                 if data_fv:
                     df_fv = pd.DataFrame(data_fv)
-                    df_fv['date'] = pd.to_datetime(df_fv['date'])
-                    df_fv.set_index('date', inplace=True)
+                    df_fv['reading_time'] = pd.to_datetime(df_fv['reading_time'])
+                    df_fv.set_index('reading_time', inplace=True)
                     df_fv = df_fv.sort_index()
                     
-                    for i, r in df_fv.iterrows():
-                       # df_fv rows logic
-                       pass
+                    # 2. Controls and State Management
+                    if 't6_anchor_date' not in st.session_state:
+                         st.session_state['t6_anchor_date'] = datetime.date.today()
 
-                    # KPIs
-                    last_date = df_fv.index.max().date()
-                    total_energy = df_fv['potencia_fv'].sum()
-                    last_val = df_fv['potencia_fv'].iloc[-1]
+                    c_ctrl1, c_nav1, c_nav2, c_nav3 = st.columns([2, 1, 3, 1])
+                    with c_ctrl1:
+                        # Time Scale Selector
+                        time_scale = st.selectbox(
+                            "Escala Temporal", 
+                            ["Anual", "Mensual", "Setmanal", "Diària"], 
+                            index=0,
+                            key='t6_scale_selector'
+                        )
                     
-                    k1, k2, k3 = st.columns(3)
-                    k1.metric("Total Acumulat (Històric)", f"{total_energy:,.1f} kWh")
-                    k2.metric("Última Lectura", f"{last_val:.2f} kWh", f"{last_date}")
-                    k3.metric("Registres", len(df_fv))
+                    # Logic: Determine Shift Delta based on Scale
+                    from dateutil.relativedelta import relativedelta
+
+                    shift_delta = relativedelta(years=1)
+                    if time_scale == "Mensual": shift_delta = relativedelta(months=1)
+                    elif time_scale == "Setmanal": shift_delta = relativedelta(weeks=1)
+                    elif time_scale == "Diària": shift_delta = relativedelta(days=1)
+
+                    with c_nav1:
+                        st.write("") # Spacer
+                        if st.button("⬅️ Enrere", key="t6_prev"):
+                            st.session_state['t6_anchor_date'] -= shift_delta
+                            
+                    with c_nav3:
+                        st.write("") # Spacer
+                        if st.button("Endavant ➡️", key="t6_next"):
+                            st.session_state['t6_anchor_date'] += shift_delta
+                            
+                    # Calculate Date Range for Filtering
+                    anchor = st.session_state['t6_anchor_date']
+                    start_view = anchor
+                    end_view = anchor 
+                    title_view = str(anchor)
+                    resample_freq = 'ME'
+
+                    if time_scale == "Anual":
+                         start_view = datetime.date(anchor.year, 1, 1)
+                         end_view = datetime.date(anchor.year, 12, 31)
+                         resample_freq = 'ME'
+                         title_view = f"Any {anchor.year}"
+                         
+                    elif time_scale == "Mensual":
+                         start_view = datetime.date(anchor.year, anchor.month, 1)
+                         next_m = start_view + relativedelta(months=1)
+                         end_view = next_m - timedelta(days=1)
+                         resample_freq = 'd'
+                         title_view = f"{month_names.get(anchor.month, anchor.month)} {anchor.year}"
+                         
+                    elif time_scale == "Setmanal":
+                         start_view = anchor - timedelta(days=anchor.weekday())
+                         end_view = start_view + timedelta(days=6)
+                         resample_freq = 'd'
+                         title_view = f"Setmana {start_view.strftime('%d/%m')} - {end_view.strftime('%d/%m/%Y')}"
+                         
+                    elif time_scale == "Diària":
+                         start_view = anchor
+                         end_view = anchor
+                         resample_freq = 'h'
+                         title_view = f"{anchor.strftime('%d/%m/%Y')}"
+
+                    with c_nav2:
+                         st.markdown(f"<h3 style='text-align: center; margin-top: 5px;'>{title_view}</h3>", unsafe_allow_html=True)
+
+                    # Filter PV Data
+                    mask_fv = (df_fv.index.date >= start_view) & (df_fv.index.date <= end_view)
+                    df_fv_filtered = df_fv[mask_fv]
                     
-                    st.markdown("##### 📅 Producció Diària")
-                    st.bar_chart(df_fv['potencia_fv'], color="#FFC300")
+                    # Resample PV Data
+                    s_fv_resampled = df_fv_filtered['potencia_fv'].resample(resample_freq).sum() if not df_fv_filtered.empty else pd.Series()
+                    if s_fv_resampled.empty:
+                         # Create specific empty index for plot structure
+                         # This avoids "No data" generic error if possible, shows empty chart
+                         pass
                     
-                    # By Month
-                    st.markdown("##### 🗓️ Producció Mensual")
-                    monthly_fv = df_fv['potencia_fv'].resample('ME').sum()
-                    st.bar_chart(monthly_fv, color="#FF5733")
+                    # 3. Chart 1: General PV Production
+                    st.subheader(f"Generació Fotovoltaica ({time_scale})")
+                    
+                    fig_gen = go.Figure()
+                    
+                    # Determine Chart Type based on Scale
+                    # Hourly/Daily usually Bar? Evolution usually Bar if discrete periods.
+                    # Solar curve (Daily) nice as Area/Line.
+                    chart_type = 'bar'
+                    if time_scale == "Diària": chart_type = 'area' # Solar curve style
+                    
+                    if not s_fv_resampled.empty:
+                        if chart_type == 'area':
+                             fig_gen.add_trace(go.Scatter(
+                                x=s_fv_resampled.index, 
+                                y=s_fv_resampled, 
+                                name="Producció FV",
+                                fill='tozeroy',
+                                line=dict(color='#FFC300')
+                             ))
+                        else:
+                             fig_gen.add_trace(go.Bar(
+                                x=s_fv_resampled.index, 
+                                y=s_fv_resampled, 
+                                name="Producció FV",
+                                marker_color='#FFC300'
+                             ))
+                    else:
+                        st.warning(f"No hi ha dades per al període: {title_view}")
+                    
+                    fig_gen.update_layout(
+                        title=f"Producció FV - {title_view}",
+                        xaxis_title="Temps",
+                        yaxis_title="kWh",
+                        hovermode="x unified"
+                    )
+                    st.plotly_chart(fig_gen, use_container_width=True)
+                    
+                    # 4. Chart 2: Comparativa vs Community Demand
+                    st.markdown("---")
+                    st.subheader("Comparativa: Producció vs Demanda Comunitat")
+                    
+                    # Check if 'df' (Consumption) is available
+                    if df is not None and not df.empty:
+                        # Identify Community CUPS
+                        rev_map_local = {v: k for k, v in CUPS_MAPPING.items()}
+                        clean_whitelist = [x.strip().upper() for x in COMMUNITY_PARTICIPANTS]
+                        
+                        community_consumption_cups = []
+                        all_cols_idx = df.columns.get_level_values(0).unique()
+                        for c in all_cols_idx:
+                            cid = rev_map_local.get(c, c)
+                            if str(cid).strip().upper() in clean_whitelist:
+                                community_consumption_cups.append(c)
+                        
+                        if community_consumption_cups:
+                            # Filter and Aggregate Consumption
+                            mask_df = (df.index.date >= start_view) & (df.index.date <= end_view)
+                            df_filtered_view = df.loc[mask_df]
+                            
+                            ts_comm_demand = pd.Series(0.0, index=df_filtered_view.index)
+                            
+                            if not df_filtered_view.empty:
+                                for c in community_consumption_cups:
+                                    cols = df_filtered_view[c].columns
+                                    # AE = Grid Consumption. Total = Grid + Self-Consumed.
+                                    
+                                    ae_col = [x for x in cols if 'AE' in x and 'kWh' in x and 'AUTOCONS' not in x]
+                                    auto_col = [x for x in cols if 'AE' in x and 'kWh' in x and 'AUTOCONS' in x]
+                                    
+                                    if ae_col: ts_comm_demand = ts_comm_demand.add(df_filtered_view[c][ae_col[0]], fill_value=0)
+                                    if auto_col: ts_comm_demand = ts_comm_demand.add(df_filtered_view[c][auto_col[0]], fill_value=0)
+                            
+                            # Resample Consumption
+                            # Use correct filtered DF freq or new freq?
+                            # freq is global for this tab from 'time_scale'
+                            # resample_freq was calculated earlier
+                            
+                            s_comm_resampled = ts_comm_demand.resample(resample_freq).sum() if not ts_comm_demand.empty else pd.Series()
+                            
+                            fig_comp_comm = go.Figure()
+                            
+                            # Trace 1: Demand (Area/Line)
+                            if not s_comm_resampled.empty:
+                                fig_comp_comm.add_trace(go.Scatter(
+                                    x=s_comm_resampled.index,
+                                    y=s_comm_resampled,
+                                    name="Demanda Comunitat",
+                                    mode='lines',
+                                    fill='tozeroy',
+                                    line=dict(color='gray', width=1),
+                                    fillcolor='rgba(128, 128, 128, 0.2)'
+                                ))
+
+                            
+                            # Trace 2: Generation (Line/Bar)
+                            fig_comp_comm.add_trace(go.Scatter(
+                                x=s_fv_resampled.index,
+                                y=s_fv_resampled,
+                                name="Producció FV Sala Nova",
+                                line=dict(color='#FFC300', width=2)
+                            ))
+                            
+                            fig_comp_comm.update_layout(
+                                title=f"Cobertura de Demanda ({time_scale})",
+                                xaxis_title="Temps",
+                                yaxis_title="kWh",
+                                hovermode="x unified",
+                                legend=dict(orientation="h", y=1.1)
+                            )
+                            st.plotly_chart(fig_comp_comm, use_container_width=True)
+                            
+                        else:
+                             st.warning("No s'han trobat CUPS de la comunitat a les dades de consum carregades.")
+                    else:
+                        st.info("Carrega dades de consum (CSV/DB) per veure la comparativa de demanda.")
                     
                 else:
                     st.info("Encara no hi ha dades a la taula FV_Sala_Nova.")
