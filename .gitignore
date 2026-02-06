@@ -5,3 +5,14 @@ __pycache__/
 .venv/
 data/
 *.xlsx
+
+# User excluded directories
+edistribucion-sant-jordi-combinar-csv/
+huawei/
+scrapper huawei/
+
+# User excluded files
+analyze_pdf.py
+fix_indent.py
+fix_indent_v2.py
+read_docx.py
