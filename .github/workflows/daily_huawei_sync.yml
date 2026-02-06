@@ -1,0 +1,35 @@
+name: Daily Huawei Sync
+
+on:
+  schedule:
+    # Run at 01:00 AM UTC daily
+    # (Note: Barcelona is UTC+1 or UTC+2, so this is 1AM or 2AM local, which fits the user's "01:00h" request reasonably well)
+    - cron: '0 0 * * *'
+  workflow_dispatch:  # Allows manual trigger
+
+jobs:
+  sync_data:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout content
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        if [ -f "shedule_huawei/requirements.txt" ]; then pip install -r shedule_huawei/requirements.txt; fi
+
+    - name: Run Daily Sync
+      env:
+        HUAWEI_USER: ${{ secrets.HUAWEI_USER }}
+        HUAWEI_PASS: ${{ secrets.HUAWEI_PASS }}
+        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      run: |
+        python shedule_huawei/daily_sync.py

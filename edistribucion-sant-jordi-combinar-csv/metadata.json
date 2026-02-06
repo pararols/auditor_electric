@@ -1,0 +1,5 @@
+{
+  "name": "Edistribucion Sant Jordi Combinar csv",
+  "description": "Una eina per combinar múltiples fitxers CSV d'autoconsum energètic en un sol fitxer unificat, alineant les dades per data i hora. Dels consums electrics que dona edistribucion",
+  "requestFramePermissions": []
+}

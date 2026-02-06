@@ -1153,12 +1153,48 @@ def render_executive_report(df, lighting_cups, building_cups, all_cups, source_m
         df_comm["NomMes"] = df_comm["Mes"].map(month_names)
         
         fig_comm = go.Figure()
-        fig_comm.add_trace(go.Bar(x=df_comm["NomMes"], y=df_comm["Generació Solar"], name="Autoconsum Solar", marker_color="gold"))
+        fig_comm.add_trace(go.Bar(x=df_comm["NomMes"], y=df_comm["Generació Solar"], name="Autoconsum", marker_color="gold"))
         # Stacked on top: Net Grid
-        fig_comm.add_trace(go.Bar(x=df_comm["NomMes"], y=df_comm["Xarxa (Facturat)"], name="Xarxa (Restant Facturat)", marker_color="lightgray"))
+        fig_comm.add_trace(go.Bar(x=df_comm["NomMes"], y=df_comm["Xarxa (Facturat)"], name="Consum Total Ajuntament", marker_color="gray"))
         
-        fig_comm.update_layout(title="Comparativa: Autoconsum vs Facturació Xarxa", xaxis={'categoryorder': 'array', 'categoryarray': list(month_names.values())}, barmode='stack')
+        fig_comm.update_layout(title="Comparativa: Autoconsum vs Consum Total Ajuntament", xaxis={'categoryorder': 'array', 'categoryarray': list(month_names.values())}, barmode='stack')
         st.plotly_chart(fig_comm, use_container_width=True)
+
+        # TABLE: Impact Data
+        st.markdown("##### 📄 Detall Mensual")
+        table_rows = []
+        for i, m_name in enumerate(df_comm["NomMes"]):
+            val_self = df_comm["Generació Solar"][i]
+            val_net = df_comm["Xarxa (Facturat)"][i]
+            val_total = val_self + val_net # Total Equipment
+            pct = (val_self / val_total * 100) if val_total > 0 else 0
+            
+            table_rows.append({
+                "Mes": m_name,
+                "Consum Total Ajuntament (kWh)": val_total,
+                "Autoconsum (kWh)": val_self,
+                "% Autoconsum": pct
+            })
+            
+        # Total Row
+        tot_self = sum(df_comm["Generació Solar"])
+        tot_net = sum(df_comm["Xarxa (Facturat)"])
+        tot_equip = tot_self + tot_net
+        tot_pct = (tot_self / tot_equip * 100) if tot_equip > 0 else 0
+        
+        table_rows.append({
+            "Mes": "**TOTAL ANY**",
+            "Consum Total Ajuntament (kWh)": tot_equip,
+            "Autoconsum (kWh)": tot_self,
+            "% Autoconsum": tot_pct
+        })
+        
+        df_impact_table = pd.DataFrame(table_rows)
+        st.table(df_impact_table.style.format({
+            "Consum Total Ajuntament (kWh)": "{:,.0f}",
+            "Autoconsum (kWh)": "{:,.0f}",
+            "% Autoconsum": "{:.1f}%"
+        }))
 
     # 8. Sala Nova PV Summary (Database)
     st.markdown("---")
@@ -1546,6 +1582,11 @@ def main():
                          delta = d_end - d_start
                          days_range = delta.days + 1
                          
+                         if days_range > 20:
+                             st.error(f"⚠️ Risc de Quota Diària: Has seleccionat {days_range} dies.")
+                             st.error("El límit diari de Huawei és de ~25 peticions. Si us plau, selecciona blocs de màxim 20 dies.")
+                             st.stop()
+                         
                          progress_text = st.empty()
                          progress_bar = st.progress(0)
                          
@@ -1564,12 +1605,47 @@ def main():
                                  for item in data_hour:
                                       item['collectTime'] = item.get('collectTime', ts)
                                       all_hourly.append(item)
+                                  
+                                 # --- IMMEDIATE SAVE LOGIC ---
+                                 try:
+                                     day_payload = []
+                                     for item in data_hour:
+                                          # Re-parse simple for DB
+                                           ms = item.get('collectTime', ts)
+                                           dt_item = datetime.datetime.fromtimestamp(ms/1000)
+                                           val = 0.0
+                                           map_data = item.get('dataItemMap', {})
+                                           if 'inverter_power' in map_data: val = float(map_data['inverter_power'])
+                                           elif 'productPower' in item: val = float(item['productPower'])
+                                           elif 'productPower' in map_data: val = float(map_data['productPower'])
+                                           
+                                           # Only save positive values? Or 0s too? 0s are valid (night).
+                                           day_payload.append({"date": dt_item.strftime("%Y-%m-%d %H:%M:%S"), "potencia_fv": val})
+                                      
+                                     if day_payload:
+                                          # Let's SUM the hourly data for this day to update the DAILY reading.
+                                          daily_sum_val = sum([x['potencia_fv'] for x in day_payload])
+                                          d_str_day = current_d.strftime("%Y-%m-%d")
+                                          
+                                          supa_client = init_supabase()
+                                          # Upsert Daily Total
+                                          supa_client.table("FV_Sala_Nova").upsert([{"date": d_str_day, "potencia_fv": daily_sum_val}], on_conflict="date").execute()
+                                          debug_container.success(f"Guardat DB: {d_str_day} ({daily_sum_val:.2f} kWh)")
+                                           
+                                 except Exception as e:
+                                     debug_container.error(f"Error guardant parcial DB: {e}")
+
                              else:
                                  debug_container.error(f"Error dia {current_d}: {data_hour}")
                                       
-                             time.sleep(5.0) # Wait 5s between days to respect rate limit
-                             
-                             progress_bar.progress((i + 1) / days_range)
+
+                             # 65s Delay to respect Rate Limit (1 req/min)
+                             # Show countdown
+                             if i < days_range - 1: # Don't wait after last day
+                                 for s in range(65, 0, -1):
+                                     progress_text.text(f"⏳ Esperant {s}s per límit API (Huawei 407)...")
+                                     time.sleep(1)
+                                 # time.sleep(65.0)
                          
                          progress_text.empty()
                          progress_bar.empty()
@@ -2775,7 +2851,7 @@ def main():
                     fig_bal = go.Figure()
                     fig_bal.add_trace(go.Bar(x=chart_self.index, y=chart_self, name='Autoconsum', marker_color='gold'))
                     # Stacked on top: Net Grid
-                    fig_bal.add_trace(go.Bar(x=chart_net_grid.index, y=chart_net_grid, name='Xarxa (Facturat)', marker_color='gray'))
+                    fig_bal.add_trace(go.Bar(x=chart_net_grid.index, y=chart_net_grid, name='Consum equipament', marker_color='gray'))
                     
                     fig_bal.update_layout(barmode='stack', xaxis_title="Temps", yaxis_title="kWh", legend=dict(orientation="h", y=1.1))
                     # Ensure x-axis shows all months if single year (by explicit tickformat or just data presence)
