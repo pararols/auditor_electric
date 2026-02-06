@@ -92,9 +92,16 @@ def main():
         # Extract Value (Logic from app.py)
         val = 0.0
         map_data = item.get('dataItemMap', {})
-        if 'inverter_power' in map_data: val = float(map_data['inverter_power'])
-        elif 'productPower' in item: val = float(item['productPower'])
-        elif 'productPower' in map_data: val = float(map_data['productPower'])
+        if 'inverter_power' in map_data: 
+            raw_val = map_data['inverter_power']
+            if raw_val is not None:
+                val = float(raw_val)
+            else:
+                val = 0.0 # Default to 0 if explicit None
+        elif 'productPower' in item and item['productPower'] is not None: 
+            val = float(item['productPower'])
+        elif 'productPower' in map_data and map_data['productPower'] is not None: 
+            val = float(map_data['productPower'])
         
         # Prepare Record for Supabase (fv_sala_nova schema: reading_time, potencia_fv)
         records.append({
