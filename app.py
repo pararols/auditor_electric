@@ -7,1297 +7,49 @@ from astral.sun import sun
 import datetime
 from datetime import timedelta
 import numpy as np
-from supabase import create_client, Client
-from huawei_client import HuaweiClient
 import time
 
-# --- Supabase Config ---
-# Credentials stored in .streamlit/secrets.toml
-try:
-    SUPABASE_URL = st.secrets["supabase"]["url"]
-    SUPABASE_KEY = st.secrets["supabase"]["key"]
-except Exception:
-    st.error("❌ No s'han trobat els secrets de Supabase. Configura .streamlit/secrets.toml")
-    
-@st.cache_resource
-def init_supabase():
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
+# --- MODULAR IMPORTS ---
+from src.core.config import CUPS_MAPPING, COMMUNITY_PARTICIPANTS, month_names, month_names_short, PAGE_TITLE, PAGE_ICON, apply_custom_styles
+from src.core.database import init_supabase, fetch_fv_data_chunked, load_from_supabase_db, sync_csv_to_db
+from src.ui.layout import render_login, render_sidebar, init_session_state
+from src.ui.views.executive import render_executive_report
+from src.utils.parsers import parse_processed_csv, process_edistribucion_files
+from src.utils.data_utils import classify_cups_by_name, detect_self_consumption_cups, get_date_range, shift_date
 
 # Page Config
 st.set_page_config(
-    page_title="Auditor Energètic & Enllumenat Públic",
-    page_icon="⚡",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    page_title=PAGE_TITLE,
+    page_icon=PAGE_ICON,
+    layout='wide',
+    initial_sidebar_state='expanded'
 )
 
-# --- Configuration ---
-CUPS_MAPPING = {
-    "ES0031408137509001NN0F": "Deixalleria",
-    "ES0031406053348001SC0F": "Enll C/ Llevant-Estació",
-    "ES0031406053355001KM0F": "Enll Veïnat Nou",
-    "ES0031406053357001QG0F": "Sala Nova",
-    "ES0031406053359002BG0F": "Enll Centre Poble",
-    "ES0031406053362001AJ0F": "Enll Mas Masó",
-    "ES0031406053560001XY0F": "Escola",
-    "ES0031406054170001JT0F": "Ajuntament",
-    "ES0031406054364001YH0F": "Enll Sobrànigues",
-    "ES0031406056222001JD0F": "Enll Estació",
-    "ES0031406056223001XC0F": "Enll C/ generalitat",
-    "ES0031406115758001TA0F": "Enll- Diana",
-    "ES0031406233593001BT0F": "Correus",
-    "ES0031406267955002TR0F": "Camp futbol i vesturaris",
-    "ES0031408030887001SD0F": "Enll-Bon repòs",
-    "ES0031408303814001QQ0F": "Llar Infants",
-    "ES0031408305363001CN0F": "Enll Rotonda crta",
-    "ES0031408332025001ZK0F": "Polivalent",
-    "ES0031408457126001XL0F": "Pavelló",
-    "ES0031408528667001SW0F": "Enll C/ nou",
-    "ES0031408691405001KF0F": "Can Burcet",
-}
-
-# --- Community Participants Whitelist ---
-COMMUNITY_PARTICIPANTS = [
-    "ES0031406053357001QG0F", # Sala Nova
-    "ES0031406053560001XY0F", # Escola
-    "ES0031406054170001JT0F", # Ajuntament
-    "ES0031408303814001QQ0F", # Llar Infants
-    "ES0031408332025001ZK0F", # Polivalent
-    "ES0031408457126001XL0F"  # Pavelló
-]
-
-# --- CSS Styling ---
-st.markdown("""
-    <style>
-    .main {
-        background-color: #f5f5f5;
-    }
-    div.block-container {
-        padding-top: 2rem;
-        padding-bottom: 2rem;
-    }
-    .metric-card {
-        background-color: white;
-        padding: 20px;
-        border-radius: 10px;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-        text-align: center;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
-# --- Helper Functions ---
-
-def parse_data(uploaded_file):
-    """
-    Parses the specific Multi-Index Header CSV format manually to avoid header length mismatches.
-    Row 0: CUPS IDs (Merged cells need forward fill)
-    Row 1: Variable names (AE_kWh, AE_AUTOCONS_kWh)
-    """
-    try:
-        uploaded_file.seek(0)
-        # Read as string/object first to handle headers safely
-        # engine='python' is more robust for separators at end of lines etc.
-        df_raw = pd.read_csv(uploaded_file, header=None, sep=';', dtype=object, engine='python')
-        
-        # 1. Extract Headers
-        header_r0 = df_raw.iloc[0].copy()
-        header_r1 = df_raw.iloc[1].copy()
-        
-        # Forward fill CUPS in row 0
-        header_r0 = header_r0.ffill()
-        
-        # 2. Extract Data
-        df_data = df_raw.iloc[2:].copy()
-        
-        # 3. Construct MultiIndex Columns
-        new_columns = []
-        for i in range(len(header_r0)):
-            h0 = header_r0.iloc[i]
-            h1 = header_r1.iloc[i]
-            
-            # Handle standard columns (Fecha/Hora) which might have empty H0
-            if pd.isna(h0) or str(h0).strip() == '':
-                h0 = 'Metadata'
-            else:
-                h0 = str(h0).strip()
-                
-            # Apply Mapping for CUPS
-            if h0 != 'Metadata':
-                # Use mapping if exists, otherwise keep original ID (Don't merge all into CAN BURCET)
-                h0 = CUPS_MAPPING.get(h0, h0)
-            
-            # Clean stripping level 1 and ensure string
-            if pd.isna(h1):
-                h1 = ""
-            else:
-                h1 = str(h1).strip()
-                
-            new_columns.append((h0, h1))
-            
-        df_data.columns = pd.MultiIndex.from_tuples(new_columns)
-        
-        # 4. Process Date and Time
-        # Identify columns
-        # We look for 'Fecha' and 'Hora' in level 1, or just take first two if they look like it
-        # Based on image: Col 0 is Fecha, Col 1 is Hora.
-        
-        # Helper to find column by level 1 name (case insensitive)
-        def get_col_by_l1(name, columns):
-            for c in columns:
-                if isinstance(c[1], str) and name.lower() in c[1].lower():
-                    return c
-            return None
-
-        date_col = get_col_by_l1('Fecha', df_data.columns)
-        time_col = get_col_by_l1('Hora', df_data.columns)
-        
-        if not date_col or not time_col:
-            # Fallback to pos 0 and 1
-            date_col = df_data.columns[0]
-            time_col = df_data.columns[1]
-
-        # Combine
-        # Standardize separators just in case
-        dates = df_data[date_col].astype(str)
-        times = df_data[time_col].astype(str)
-        
-        # Handle '24' hour or other quirks if needed, but assuming standard 0-23
-        # In Spain sometimes 1-24 is used. Image shows '0', '1', '2'... so standard 0-23 or 1-24?
-        # Image shows '0'.
-        
-        # If time is just an integer hour (0, 1, 2), convert to HH:00
-        # If it's already HH:MM, fine.
-        # Let's clean the time string.
-        def clean_time(t):
-            t = t.strip()
-            if t.isdigit(): # "0", "1"
-                return f"{int(t):02d}:00"
-            return t # Assume format is okay
-            
-        times = times.apply(clean_time)
-        
-        datetime_str = dates + ' ' + times
-        
-        # Create Index directly
-        datetime_index = pd.to_datetime(datetime_str, dayfirst=True, errors='coerce')
-        
-        # Assign index
-        df_data.index = datetime_index
-        df_data.index.name = 'Datetime'
-        
-        # Drop rows with invalid dates (NaT)
-        df_data = df_data[df_data.index.notna()]
-        
-        # Drop the original metadata columns
-        df_data = df_data.drop(columns=[date_col, time_col])
-        
-        # 5. Convert Numeric Columns
-        # Replace decimal ',' with '.' and cast
-        for col in df_data.columns:
-            # col is a tuple (CUPS, Var)
-            if df_data[col].dtype == object:
-                # Replace comma with dot
-                df_data[col] = df_data[col].astype(str).str.replace('.', '', regex=False) # Remove thousand separators if any?
-                # Wait, European: 1.000,00 -> remove dot, replace comma
-                # But CSV usually simple. User said: ", com a decimal".
-                # If there are thousands separators (.), we should remove them.
-                # But careful not to remove dot if it's not there.
-                # Assuming simple format "0,065".
-                
-                # Safer: replace ',' with '.'
-                val_series = df_data[col].astype(str).str.replace(',', '.', regex=False)
-                df_data[col] = pd.to_numeric(val_series, errors='coerce').fillna(0)
-                
-        return df_data
-
-    except Exception as e:
-        st.error(f"Error parsing file: {e}")
-        return None
-
-# --- New Helper: Edistribucion Raw Importer ---
-def process_edistribucion_files(uploaded_files):
-    """
-    Parses and merges multiple raw Edistribucion CSVs.
-    Logic ported from React App:
-    - Normalizes hours (1-24 -> 0-23 if needed).
-    - Merges by CUPS and Timestamp.
-    - Output: DataFrame with MultiIndex Columns (CUPS, Variable) and Datetime Index.
-    """
-    all_records = []
-    
-    progress_text = st.empty()
-    progress_bar = st.progress(0)
-    
-    for i, file in enumerate(uploaded_files):
-        progress_text.text(f"Processant {file.name}...")
-        try:
-            # Read CSV
-            # Edistribucion format: ; separator, , decimal
-            # Encoding often ISO-8859-1 or mbcs on Windows
-            df = pd.read_csv(file, sep=';', encoding='latin-1', dtype=str)
-            
-            # Check required columns
-            required = ['CUPS', 'Fecha', 'Hora', 'AE_kWh']
-            if not all(col in df.columns for col in required):
-                st.warning(f"Saltant {file.name}: Falten columnes requerides.")
-                continue
-                
-            # Normalize Hours
-            # Check range
-            hours = pd.to_numeric(df['Hora'], errors='coerce')
-            min_h = hours.min()
-            max_h = hours.max()
-            
-            # Logic from React: If no 0 and (has 24 OR min is 1), shift -1
-            has_zero = (hours == 0).any()
-            has_24 = (hours == 24).any()
-            
-            if not has_zero and (has_24 or min_h == 1):
-                df['Hora'] = hours - 1
-            else:
-                df['Hora'] = hours
-                
-            # Create Timestamp
-            # Fecha format usually DD/MM/YYYY
-            # Hora is 0..23 integer
-            
-            # Vectorized Date Parsing
-            # Combine Date + Hour -> "DD/MM/YYYY HH:00"
-            df['datetime_str'] = df['Fecha'] + ' ' + df['Hora'].astype(str).str.pad(2, fillchar='0') + ':00'
-            df['reading_time'] = pd.to_datetime(df['datetime_str'], format='%d/%m/%Y %H:%M', errors='coerce')
-            
-            # Extract relevant columns
-            # AE_AUTOCONS_kWh equivalent
-            # Sometimes called 'AE_AUTOCONS_kWh' or similar. 
-            # In types.ts it was AE_AUTOCONS_kWh.
-            
-            # We want to extract [Time, CUPS, AE, Autocons]
-            # And add to a mega list to pivot later
-            
-            # Normalize numeric
-            df['AE_kWh'] = df['AE_kWh'].str.replace('.', '', regex=False).str.replace(',', '.')
-            df['AE_kWh'] = pd.to_numeric(df['AE_kWh'], errors='coerce').fillna(0)
-            
-            if 'AE_AUTOCONS_kWh' in df.columns:
-                 df['AE_AUTOCONS_kWh'] = df['AE_AUTOCONS_kWh'].str.replace('.', '', regex=False).str.replace(',', '.')
-                 df['AE_AUTOCONS_kWh'] = pd.to_numeric(df['AE_AUTOCONS_kWh'], errors='coerce').fillna(0)
-            else:
-                 df['AE_AUTOCONS_kWh'] = 0
-            
-            # Keep only valid times
-            df = df.dropna(subset=['reading_time'])
-            
-            # Store necessary columns
-            # Need strict reference to CUPS from file
-            # If CUPS column is constant in file (usually is), take first valid
-            cups_raw = df['CUPS'].iloc[0] if not df.empty else "UNKNOWN"
-            # Apply Mapping (ID -> Name) to ensure consistency with legacy data
-            cups_file = CUPS_MAPPING.get(cups_raw, cups_raw)
-            
-            # We append sub-dataframes to list
-            subset = df[['reading_time', 'AE_kWh', 'AE_AUTOCONS_kWh']].copy()
-            subset['CUPS'] = cups_file
-            
-            all_records.append(subset)
-            
-        except Exception as e:
-            st.error(f"Error processant {file.name}: {e}")
-            
-        progress_bar.progress((i + 1) / len(uploaded_files))
-            
-    progress_text.empty()
-    progress_bar.empty()
-    
-    if not all_records:
-        return None
-        
-    # Concatenate all
-    big_df = pd.concat(all_records, ignore_index=True)
-    
-    # Pivot to Wide Format (Time x CUPS_Variable)
-    # We want columns: (CUPS, 'AE_kWh'), (CUPS, 'AE_AUTOCONS_kWh')
-    
-    # Melt first? No, pure pivot.
-    # Pivot table supports multiple values columns
-    pivot = big_df.pivot_table(index='reading_time', columns='CUPS', values=['AE_kWh', 'AE_AUTOCONS_kWh'], aggfunc='last')
-    
-    # Pivot creates columns MultiIndex: (Variable, CUPS) -> ('AE_kWh', 'ES...')
-    # We want (CUPS, Variable) -> ('ES...', 'AE_kWh')
-    pivot.columns = pivot.columns.swaplevel(0, 1)
-    pivot.columns.names = [None, None] # Clean names
-    
-    # Sort columns
-    pivot.sort_index(axis=1, inplace=True)
-    
-    # Index name
-    pivot.index.name = 'Datetime'
-    
-    # Fill NAs
-    pivot = pivot.fillna(0)
-    
-    return pivot
-
-# --- Supabase Helpers ---
-
-def login_form():
-    st.markdown("#### 🔐 Accés al Sistema")
-    email = st.text_input("Correu Electrònic")
-    password = st.text_input("Contrasenya", type="password")
-    
-    if st.button("Iniciar Sessió"):
-        if not email or not password:
-            st.error("Introdueix usuari i contrasenya")
-            return
-            
-        supabase = init_supabase()
-        try:
-            # Attempt login
-            res = supabase.auth.sign_in_with_password({"email": email, "password": password})
-            st.session_state.user = res.user
-            st.session_state.session = res.session
-            st.rerun()
-        except Exception as e:
-            st.error(f"Error d'accés: {e}")
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_from_supabase_db(start_date=None, end_date=None):
-    """
-    Fetch readings using Optimized Wide Format (JSONB), optionally filtered by date.
-    Lazy Loading Implementation (Skill: Python Pattern 19).
-    """
-    supabase = init_supabase()
-    
-    # Defaults: If no date provided, fetch ALL (Legacy behavior, but we will control this from main)
-    # But to be safe, if None, we imply "All available" or "Current Year" depending on caller?
-    # Let's keep it flexible: None means no filter.
-    
-    status_text = st.empty()
-    status_text.text("Descarregant dades (Format Optimitzat)...")
-    
-    all_data = []
-    chunk_size = 1000 # Supabase API default limit is 1000. Must match or be lower to detect end correctly.
-    offset = 0
-    
-    while True:
-        try:
-            query = supabase.table("energy_readings_wide").select("*").order("reading_time")
-            
-            if start_date:
-                query = query.gte("reading_time", start_date.isoformat())
-            if end_date:
-                # Add one day to include the end_date fully if it's just a date object
-                # If it's datetime, exact. Assuming date strings or objects here.
-                # safely convert to string
-                query = query.lte("reading_time", end_date.isoformat())
-
-            response = query.range(offset, offset + chunk_size - 1).execute()
-            chunk = response.data
-            
-            if not chunk:
-                break
-                
-            all_data.extend(chunk)
-            offset += len(chunk)
-            
-            # Optimization: If chunk is smaller than limit, we are done.
-            if len(chunk) < chunk_size:
-                break
-                 
-        except Exception as e:
-             st.error(f"Error descarregant: {e}")
-             break
-             
-    status_text.empty()
-    data = all_data
-    
-    if not data:
-        return None
-        
-    # Convert to DataFrame
-    # Structure: [{'reading_time': '...', 'data': {'CUPS1_VAR': val, ...}}, ...]
-    
-    # 1. Create DF from main list
-    df_main = pd.DataFrame(data)
-    
-    if df_main.empty: return None
-
-    # 2. Extract JSONB 'data' column into separate columns
-    # This is fast in Pandas
-    meta_df = df_main[['reading_time']].copy()
-    data_df = pd.json_normalize(df_main['data'])
-    
-    # 3. Join back
-    df_final = pd.concat([meta_df, data_df], axis=1)
-    
-    # Fill Missing Values with 0 (for new rows that don't have all cups)
-    df_final = df_final.fillna(0)
-    
-    # 4. Handle DateTime
-    df_final['reading_time'] = pd.to_datetime(df_final['reading_time'], errors='coerce')
-    if df_final['reading_time'].dt.tz is not None:
-         df_final['reading_time'] = df_final['reading_time'].dt.tz_localize(None)
-         
-    df_final = df_final.set_index('reading_time')
-    df_final.index.name = 'Datetime'
-    
-    # 5. Restore MultiIndex Columns
-    # Current Cols: "CUPS_VAR" (e.g. "ES00..._AE_kWh")
-    # Need to split back to (CUPS, VAR)
-    
-    new_cols = []
-    for col in df_final.columns:
-        # Split by first underscore? No, CUPS can have no underscores usually, but variable might.
-        # Strategy: Use a known separator during upload. Let's use "||" to be safe? 
-        # Or just match known CUPS length? CUPS is usually 20 or 22 chars.
-        # Let's assume separator "___" (3 underscores) for safety during Sync.
-        
-        parts = col.split("___")
-        if len(parts) == 2:
-            cups_id = parts[0]
-            variable = parts[1]
-            # Map ID -> Name
-            cups_name = CUPS_MAPPING.get(cups_id, cups_id)
-            new_cols.append((cups_name, variable))
-        else:
-            # Fallback
-            original_id = col
-            mapped_name = CUPS_MAPPING.get(original_id, original_id)
-            new_cols.append(("Unknown", mapped_name))
-            
-    df_final.columns = pd.MultiIndex.from_tuples(new_cols)
-    df_final.columns.names = [None, None]
-    
-    df_final.sort_index(inplace=True)
-    
-    return df_final
-
-def sync_csv_to_db(df, mode="merge"):
-    """
-    Uploads using Optimized Wide Format (JSONB).
-    mode: 'merge' (smart merge via RPC), 'replace' (truncate then insert)
-    """
-    supabase = init_supabase()
-    
-    if mode == "replace":
-        st.warning("⚠️ Esborrant dades existents...")
-        try:
-            # Use RPC for fast truncation (avoid timeout on large table)
-            supabase.rpc("truncate_energy_readings", {}).execute()
-            st.success("Buidatge complet.")
-        except Exception as e:
-            st.error(f"Error esborrant: {e}")
-            return
-    
-    # Prepare Wide Format
-    # df Index: Datetime
-    # df Columns: MultiIndex (CUPS, Variable)
-    
-    # 1. Flatten Columns with Safe Separator "___"
-    df_flat = df.copy()
-    flat_cols = [f"{c[0]}___{c[1]}" for c in df_flat.columns]
-    df_flat.columns = flat_cols
-    
-    # 2. Reset Index to handle datetime
-    df_flat.index.name = 'reading_time'
-    df_flat = df_flat.reset_index()
-    
-    # 3. Deduplicate on reading_time to prevent "ON CONFLICT" errors within the same batch
-    # This ensures unique keys for the Primary Key
-    df_flat = df_flat.drop_duplicates(subset=['reading_time'], keep='last')
-    
-    # 3. IterateRows is slow. vectorized usage?
-    # We want: [{'reading_time': T, 'data': {Col1: Val1, Col2: Val2...}}]
-    
-    # Convert 'reading_time' to string ISO
-    df_flat['reading_time'] = df_flat['reading_time'].dt.strftime('%Y-%m-%d %H:%M:%S')
-    
-    # Efficient conversion
-    total_rows = len(df_flat)
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    chunk_size = 500
-    
-    # Extract measurement columns
-    meas_cols = [c for c in df_flat.columns if c != 'reading_time']
-    
-    # ToDict records of just measurements
-    data_dicts = df_flat[meas_cols].to_dict(orient='records')
-    times = df_flat['reading_time'].tolist()
-    
-    final_payload = []
-    for t, d in zip(times, data_dicts):
-        # Filter None/NaN from d to save space? Optional.
-        # Pandas to_dict usually keeps NaNs. JSON standard doesn't support NaN.
-        # Clean dict:
-        clean_d = {k: v for k, v in d.items() if pd.notna(v)}
-        final_payload.append({
-            'reading_time': t,
-            'data': clean_d
-        })
-        
-    # Upload Chunks
-    for k in range(0, len(final_payload), chunk_size):
-        chunk = final_payload[k:k+chunk_size]
-        try:
-            if mode == "replace":
-                # Standard Upsert is faster/simpler for Replace (fresh table)
-                supabase.table("energy_readings_wide").upsert(chunk, on_conflict='reading_time').execute()
-            else:
-                # Merge Mode: Use Custom RPC to merge JSONB (partial updates)
-                supabase.rpc("merge_readings", {"payload": chunk}).execute()
-            
-            prog = min((k + len(chunk)) / total_rows, 1.0)
-            progress_bar.progress(prog)
-            status_text.text(f"Pujant... {k}/{total_rows}")
-        except Exception as e:
-            st.error(f"Error pujant chunk {k}: {e}")
-            
-    status_text.success("Sincronització Optimitzada Completada! 🚀")
-
-
-
-def classify_cups_by_name(df):
-    """
-    Classifies CUPS into 'Building' or 'Public Lighting' based on Name.
-    Public Lighting: Starts with 'Enll' (case insensitive).
-    """
-    cups_list = df.columns.get_level_values(0).unique()
-    
-    lighting = []
-    buildings = []
-    
-    for cups in cups_list:
-        # Check if name starts with 'Enll'
-        if str(cups).lower().startswith("enll"):
-            lighting.append(cups)
-        else:
-            buildings.append(cups)
-            
-    return lighting, buildings
-
-# --- New Helper: Date Navigator ---
-def get_date_range(view_mode, anchor_date):
-    """Returns (start_date, end_date, freq_alias) based on view mode and anchor."""
-    start_date = None
-    end_date = None
-    freq = 'h' # default
-    
-    if view_mode == 'Diària':
-        start_date = anchor_date
-        end_date = anchor_date
-        freq = '1h'
-    elif view_mode == 'Setmanal':
-        start_date = anchor_date - timedelta(days=anchor_date.weekday())
-        end_date = start_date + timedelta(days=6)
-        freq = '1d' # Daily bars for weekly view
-    elif view_mode == 'Mensual':
-        start_date = anchor_date.replace(day=1)
-        end_date = (start_date + timedelta(days=32)).replace(day=1) - timedelta(days=1)
-        freq = '1d'
-    elif view_mode == 'Anual':
-        start_date = anchor_date.replace(month=1, day=1)
-        end_date = anchor_date.replace(month=12, day=31)
-        freq = 'ME' # Monthly bars
-        
-    return start_date, end_date, freq
-
-def shift_date(view_mode, anchor_date, direction):
-    """Shifts the anchor date forward or backward."""
-    if view_mode == 'Diària':
-        return anchor_date + timedelta(days=direction)
-    elif view_mode == 'Setmanal':
-        return anchor_date + timedelta(weeks=direction)
-    elif view_mode == 'Mensual':
-        # Shift month
-        new_month = anchor_date.month + direction
-        year_adj = 0
-        if new_month > 12:
-            new_month = 1
-            year_adj = 1
-        elif new_month < 1:
-            new_month = 12
-            year_adj = -1
-        return anchor_date.replace(year=anchor_date.year + year_adj, month=new_month, day=1)
-    elif view_mode == 'Anual':
-        return anchor_date.replace(year=anchor_date.year + direction)
-    return anchor_date
-
-# --- Main App Interface ---
-
-# --- Executive Report Mode ---
-def render_executive_report(df, lighting_cups, building_cups, all_cups, source_mode=""):
-    st.header("📋 Informe Executiu Anual")
-    
-    # 1. Year Selection
-    # If DB Mode, we may not have all years in 'df' (Lazy Loaded). 
-    # Hardcode reasonable range or fetch? For speed, let's offer likely years.
-    
-    if source_mode == "Base de Dades (Supabase)":
-        # Dynamic Fetch via RPC
-        client = init_supabase()
-        try:
-             res = client.rpc("get_distinct_years").execute()
-             # Result is [{'year': 2024}, {'year': 2023}...] sorted DESC by RPC
-             years = sorted([item['year'] for item in res.data]) if res.data else [] 
-        except Exception as e:
-             st.error(f"Error recuperant anys: {e}")
-             years = []
-             
-        # Fallback if empty (e.g. first run) to avoid crash
-        if not years:
-             years = [datetime.date.today().year]
-    else:
-        years = sorted(df.index.year.unique()) if df is not None else []
-        
-    if not years:
-        st.warning("No hi ha dades disponibles.")
-        return
-
-    if len(years) < 2:
-        st.warning("Es necessiten almenys 2 anys de dades per generar l'informe comparatiu.")
-        target_year = years[-1] # Last available
-        prev_year = target_year - 1
-    else:
-        col_y1, col_y2 = st.columns(2)
-        # Default: Last Year vs Previous available
-        default_target_idx = len(years) - 1
-        default_prev_idx = len(years) - 2 # The one before last
-        
-        target_year = col_y1.selectbox("Any d'Anàlisi", years, index=default_target_idx)
-        prev_year_options = [y for y in years if y != target_year]
-        
-        # Recalculate default prev index based on options
-        # If target is Max, previous avail is Max in options.
-        def_prev_opt_idx = len(prev_year_options) - 1 if prev_year_options else 0
-        
-        prev_year = col_y2.selectbox("Any de Comparació", prev_year_options, index=def_prev_opt_idx)
-
-    # 2. Data Acquisition (RPC vs Local)
-    
-    # Structure to hold monthly series for charts and totals
-    # We need: Total All, Total Light, Total Build per Year
-    # And: Monthly Series for Chart
-    
-    data_target = None
-    data_prev = None
-    
-    @st.cache_data(ttl=300) # Short cache for report queries
-    def fetch_year_sums_rpc(year):
-        """Fetches monthly sums for a specific year via RPC."""
-        s = datetime.date(year, 1, 1)
-        e = datetime.date(year, 12, 31)
-        # Assuming RPC signature: get_monthly_sums(start_date, end_date)
-        client = init_supabase()
-        try:
-             res = client.rpc("get_monthly_sums", {
-                 "start_date": s.isoformat(), 
-                 "end_date": e.isoformat()
-             }).execute()
-             return res.data
-        except Exception as e:
-             st.error(f"Error RPC: {e}")
-             return []
-
-    # Processing Logic
-    def process_data(year_data, subset_labels):
-        """
-        Input: List of dicts [{'month': '2024-01-01', 'cups': 'ES..._AE_kWh', 'total_kwh': 123}, ...]
-        Output: Total Sum, Monthly Series
-        """
-        if not year_data:
-             return 0, pd.Series(0.0, index=range(1, 13))
-             
-        # Conversion to DF
-        dframe = pd.DataFrame(year_data)
-        if dframe.empty: return 0, pd.Series(0.0, index=range(1, 13))
-        
-        # 'cups' column contains VAR too e.g. "ES..._AE_kWh". 
-        # We need to filter for AE_kWh and optionally by subset (cups IDs)
-        
-        # 1. Filter for Active Energy
-        dframe = dframe[dframe['cups'].str.contains('_AE_kWh') & ~dframe['cups'].str.contains('AUTOCONS')]
-        
-        # 2. Filter by Subset if provided (cups IDs from 'subset_labels')
-        # subset_labels comes from classify_cups_by_name matches 'Name' or 'ID'.
-        # The 'cups' column in RPC result matches DF column names (MultiIndex Level 0 + Var).
-        # We need to extract the CUPS ID from string "ESxxx___AE_kWh" or similar.
-        
-        # Helper to extract ID from "ES002100000..."
-        # Simply check if startswith any of the target IDs?
-        # Map Name -> ID first.
-        
-        # Let's assume passed 'subset_labels' are DataFrame Columns Level 0 (Names or IDs).
-        # Our RPC 'cups' are formatted keys. 
-        # Need to align this mapping.
-        
-        filtered_df = dframe.copy()
-        
-        if subset_labels is not None:
-             # This is tricky without the exact mapping.
-             # Option: Filter based on substring match?
-             # Or: relies on 'df' existing mapping?
-             # Let's revert to simplistic: All Items use 'all_cups' logic?
-             # Actually, simpler:
-             # Helper: Load from Supabase (Cached)
-             # If we are in DB mode, 'lighting_cups' list contains Names (e.g. "Ajuntament").
-             # We need to map Name -> ID to filter.
-             # We have CUPS_MAPPING dict in global scope.
-             rev_map = {v: k for k, v in CUPS_MAPPING.items()}
-             
-             target_ids = []
-             for lbl in subset_labels:
-                 # If lbl is a Name, get ID. If ID, keep ID.
-                 tid = rev_map.get(lbl, lbl)
-                 target_ids.append(tid)
-             
-             # Create pattern? or set check.
-             # Row 'cups' is "ID___VAR" usually (from our upload logic assumption in load_db)
-             # Wait, sync_csv_to_db uses: final_payload.append({'reading_time': ..., 'data': { 'ES..._AE_kWh': val } })
-             # So keys are IDs? Or Names?
-             # 'parse_data' uses Names if mapped?
-             # Let's look at `parse_data`. It renames columns to Names.
-             # Then `sync_csv_to_db` uses `d.to_dict(orient='records')`.
-             # So the keys in JSONB are likely "Ajuntament___AE_kWh" if the DF columns were names?
-             # CRITICAL CHECK: `sync_csv_to_db`
-             # If keys are Names, then `lighting_cups` (Names) will match.
-             
-             # Filter:
-             # row['cups'] starts with one of target_ids/names?
-             # Regex is slow. Tuple prefix?
-             
-             # Let's filter:
-             mask = filtered_df['cups'].apply(lambda x: any(x.startswith(str(t)) for t in subset_labels))
-             filtered_df = filtered_df[mask]
-
-        if filtered_df.empty: return 0, pd.Series(0.0, index=range(1, 13))
-
-        # Sum
-        total_val = filtered_df['total_kwh'].sum()
-        
-        # Monthly Series
-        filtered_df['month_idx'] = pd.to_datetime(filtered_df['month']).dt.month
-        monthly_s = filtered_df.groupby('month_idx')['total_kwh'].sum()
-        
-        return total_val, monthly_s
-    
-    def calculate_per_cup_totals_rpc(year_data):
-        """
-        Aggregates RPC data by CUPS Name.
-        Input: RPC List.
-        Output: Dict { 'CupName': total_kwh }
-        """
-        if not year_data: return {}
-        idf = pd.DataFrame(year_data)
-        if idf.empty: return {}
-        
-        # Filter for AE_kWh (ignore AUTOCONS for consumption ranking?)
-        # Convention: AE_kWh is grid/total consumption. 
-        # But 'all_cups' usually implies Consumption analysis.
-        idf = idf[idf['cups'].str.contains('_AE_kWh') & ~idf['cups'].str.contains('AUTOCONS')]
-        if idf.empty: return {}
-        
-        totals = {}
-        # Iterate rows is safer or group by substring?
-        # Extract ID from "ID___VAR"
-        # Since we don't have a clean column with just ID, let's extract.
-        # Format assumed: "ESxxxx___AE_kWh" or "ESxxxx_AE_kWh"
-        # Let's split by underscore.
-        
-        # Optimize: 
-        # 1. Group by 'cups' key first (sum over months)
-        grouped = idf.groupby('cups')['total_kwh'].sum()
-        
-        for k, val in grouped.items():
-            # k is like "ES0031405020755001NZ0F___AE_kWh"
-            # Split
-            parts = k.split('___') # Try triple first
-            if len(parts) < 2:
-                 parts = k.split('_AE_kWh') # Try suffix
-            
-            p_id = parts[0]
-            # Map ID -> Name
-            p_name = CUPS_MAPPING.get(p_id, p_id)
-            totals[p_name] = totals.get(p_name, 0) + val
-            
-        return totals
-
-    # --- EXECUTION ---
-    per_cup_target = {}
-    per_cup_prev = {}
-
-    if source_mode == "Base de Dades (Supabase)":
-        # RPC PATH
-        raw_target = fetch_year_sums_rpc(target_year)
-        raw_prev = fetch_year_sums_rpc(prev_year)
-        
-        # Update process_data logic fix: passing target_ids to lambda
-        # But simpler: we can just calculate totals independently here since we have a dedicated `calculate_per_cup_totals_rpc`
-        # Actually `process_data` was for the KPIs. Let's fix it or bypass it.
-        # Let's fix `process_data` implicitly by not using subset filtering there heavily or fixing the bug.
-        # Let's override `process_data` filtering:
-        
-        # Re-define process_data to be simpler/correct
-        def process_and_sum(year_data, subset_names):
-             # 1. Get Totals Dict
-             totals_dict = calculate_per_cup_totals_rpc(year_data)
-             # 2. Filter by subset
-             relevant_total = 0
-             for name in subset_names:
-                 relevant_total += totals_dict.get(name, 0)
-             
-             # 3. Monthly Series (Global for year)
-             # This is a bit disjointed. `process_data` returned (Total, Series).
-             # Let's just do it manually here.
-             
-             # Monthly Series needs to filter by subset too.
-             # This suggests `process_data` was the right abstraction if fixed.
-             pass 
-             
-        # ... Let's stick to the previous `process_data` structure but Fix the Bug inside it?
-        # No, I can't edit inside `process_data` easily as I'm replacing the EXECUTION block.
-        # I will rewrite `process_data` logic here inline or helper.
-        
-        # Helper for RPC KPI
-        def get_rpc_kpis(raw_data, subset_names):
-            if not raw_data: return 0, pd.Series(0.0, index=range(1, 13))
-            df_r = pd.DataFrame(raw_data)
-            if df_r.empty: return 0, pd.Series(0.0, index=range(1, 13))
-            
-            # Filter AE
-            df_r = df_r[df_r['cups'].str.contains('_AE_kWh') & ~df_r['cups'].str.contains('AUTOCONS')]
-            
-            # Filter by Subset (Names)
-            # Keys in Supabase are "Name___VAR" (e.g. "Escola___AE_kWh") 
-            # subset_names contains Names (e.g. "Escola")
-            # So we do NOT need to map to IDs. 
-            
-            target_names = set(subset_names)
-            
-            # Row match function
-            def is_match(row_key):
-                # row_key is "Name___VAR"
-                parts = row_key.split('___')
-                if len(parts) > 1:
-                     name_part = parts[0]
-                else:
-                     # Fallback if no separator
-                     name_part = row_key.replace('_AE_kWh','')
-                     
-                # Handle cases where Name might need mapping ONLY if it was an ID
-                # But here we assume it matches the list we have.
-                # Double check: if target_names has "Ajuntament" and key is "Ajuntament", we are good.
-                
-                return name_part in target_names
-            
-            # Apply Filter 
-            # Optimization: could verify if any target_names startswith key? No, key starts with name.
-            mask = df_r['cups'].apply(is_match)
-            df_sub = df_r[mask]
-            
-            if df_sub.empty: return 0, pd.Series(0.0, index=range(1, 13))
-            
-            val = df_sub['total_kwh'].sum()
-            df_sub['m'] = pd.to_datetime(df_sub['month']).dt.month
-            ser = df_sub.groupby('m')['total_kwh'].sum()
-            return val, ser
-
-        total_target, s_monthly_target = get_rpc_kpis(raw_target, all_cups)
-        total_prev, s_monthly_prev = get_rpc_kpis(raw_prev, all_cups)
-        
-        light_target, _ = get_rpc_kpis(raw_target, lighting_cups)
-        build_target, _ = get_rpc_kpis(raw_target, building_cups)
-        light_prev, _ = get_rpc_kpis(raw_prev, lighting_cups)
-        build_prev, _ = get_rpc_kpis(raw_prev, building_cups)
-        
-        # Populate Dictionary for Ranking
-        per_cup_target = calculate_per_cup_totals_rpc(raw_target)
-        per_cup_prev = calculate_per_cup_totals_rpc(raw_prev)
-        
-    else:
-        # LOCAL DF PATH (Legacy)
-        df_target = df[df.index.year == target_year]
-        df_prev = df[df.index.year == prev_year]
-        
-        def get_sum_local(dframe, subset_cups):
-            if dframe.empty: return 0
-            t = 0
-            for c in subset_cups:
-                if c in dframe.columns:
-                    cols = dframe[c].columns
-                    ae = [x for x in cols if 'AE' in x and 'kWh' in x and 'AUTOCONS' not in x]
-                    if ae: t += dframe[c][ae[0]].sum()
-            return t
-        
-        total_target = get_sum_local(df_target, all_cups)
-        total_prev = get_sum_local(df_prev, all_cups)
-        
-        light_target = get_sum_local(df_target, lighting_cups)
-        build_target = get_sum_local(df_target, building_cups)
-        light_prev = get_sum_local(df_prev, lighting_cups)
-        build_prev = get_sum_local(df_prev, building_cups)
-        
-        # Monthly S logic local
-        def get_monthly_local(dframe):
-            if dframe.empty: return pd.Series(0.0, index=range(1, 13))
-            # Resample ME
-            total_s = pd.Series(0.0, index=range(1, 13)) 
-            monthly_totals = {}
-            for m in range(1, 13):
-                subset = dframe[dframe.index.month == m]
-                val = get_sum_local(subset, all_cups)
-                monthly_totals[m] = val
-            return pd.Series(monthly_totals)
-            
-        s_monthly_target = get_monthly_local(df_target)
-        s_monthly_prev = get_monthly_local(df_prev)
-        
-        # Populate Dictionary for Ranking (Local)
-        for cup in all_cups:
-            per_cup_target[cup] = get_sum_local(df_target, [cup])
-            per_cup_prev[cup] = get_sum_local(df_prev, [cup])
-
-
-    # --- METRICS DISPLAY ---
-    delta_val = total_target - total_prev
-    delta_pct = (delta_val / total_prev) * 100 if total_prev > 0 else 0
-    
-    st.subheader("Visió General")
-    col_kpi1, col_kpi2, col_kpi3 = st.columns(3)
-    
-    col_kpi1.metric(f"Consum Total {target_year}", f"{total_target:,.0f} kWh", delta=f"{delta_val:,.0f} kWh", delta_color="inverse")
-    col_kpi2.metric(f"Variació vs {prev_year}", f"{delta_pct:+.1f}%", delta=f"{delta_pct:+.1f}%", delta_color="inverse")
-    
-    light_var = ((light_target - light_prev) / light_prev * 100) if light_prev > 0 else 0
-    build_var = ((build_target - build_prev) / build_prev * 100) if build_prev > 0 else 0
-    
-    col_kpi3.metric(f"Enllumenat / Edificis ({target_year})", f"{light_target:,.0f} / {build_target:,.0f} kWh")
-    col_kpi3.markdown(f"**Var:** 💡 {light_var:+.1f}% | 🏢 {build_var:+.1f}%")
-    
-    # 4. Monthly Evolution (Chart)
-    st.subheader(f"Evolució Mensual: {target_year} vs {prev_year}")
-    
-    df_chart = pd.DataFrame({"Mes": range(1, 13)})
-    
-    # Fill from series (indexed 1..12 or compatible)
-    def safe_get(series, idx):
-        if idx in series.index: return series[idx]
-        return 0.0
-        
-    df_chart[f"{prev_year}"] = df_chart["Mes"].apply(lambda x: safe_get(s_monthly_prev, x))
-    df_chart[f"{target_year}"] = df_chart["Mes"].apply(lambda x: safe_get(s_monthly_target, x))
-    
-    month_names = {1: 'Gen', 2: 'Feb', 3: 'Mar', 4: 'Abr', 5: 'Mai', 6: 'Jun', 
-                   7: 'Jul', 8: 'Ago', 9: 'Set', 10: 'Oct', 11: 'Nov', 12: 'Des'}
-    df_chart["NomMes"] = df_chart["Mes"].map(month_names)
-    
-    fig_bar = go.Figure()
-    fig_bar.add_trace(go.Bar(x=df_chart["NomMes"], y=df_chart[f"{prev_year}"], name=str(prev_year), marker_color='lightgrey'))
-    fig_bar.add_trace(go.Bar(x=df_chart["NomMes"], y=df_chart[f"{target_year}"], name=str(target_year), marker_color='#1f77b4'))
-    
-    fig_bar.update_layout(
-        title="Comparativa Mensual", 
-        barmode='group',
-        xaxis={'categoryorder': 'array', 'categoryarray': list(month_names.values())}
-    )
-    st.plotly_chart(fig_bar, use_container_width=True)
-    
-    # 5. Top Movers
-    st.subheader("Rànquing de Variacions (Per CUPS)")
-    col_top1, col_top2 = st.columns(2)
-    
-    diffs = []
-    # Use computed dictionaries instead of get_sum call
-    # Iterate keys from both dicts to be safe? 
-    # Or iterate all_cups (Names).
-    
-    for cup_name in all_cups:
-        # cup_name is Name (e.g. "Ajuntament")
-        val_t = per_cup_target.get(cup_name, 0)
-        val_p = per_cup_prev.get(cup_name, 0)
-        
-        diff = val_t - val_p
-        pct = (diff / val_p * 100) if val_p > 0 else 0
-        name = CUPS_MAPPING.get(cup_name, cup_name)
-        diffs.append({"Nom": name, "Diferència (kWh)": diff, "Diferència (%)": pct})
-    
-    df_diffs = pd.DataFrame(diffs)
-    
-    with col_top1:
-        st.markdown("##### 📉 Top 5 Estalvis")
-        savings = df_diffs[df_diffs["Diferència (kWh)"] < 0].sort_values("Diferència (kWh)", ascending=True).head(5)
-        if not savings.empty:
-             st.table(savings.style.format({"Diferència (kWh)": "{:,.0f}", "Diferència (%)": "{:+.1f}%"}))
-        else:
-             st.info("Sense estalvis.")
-             
-    with col_top2:
-        st.markdown("##### 📈 Top 5 Augments")
-        increases = df_diffs[df_diffs["Diferència (kWh)"] > 0].sort_values("Diferència (kWh)", ascending=False).head(5)
-        if not increases.empty:
-             st.table(increases.style.format({"Diferència (kWh)": "{:,.0f}", "Diferència (%)": "{:+.1f}%"}))
-        else:
-             st.info("Sense augments.")
-
-    # 6. Detailed Table
-    st.subheader("Detall Mensual")
-    st.dataframe(df_chart.style.format({f"{target_year}": "{:,.0f}", f"{prev_year}": "{:,.0f}"}), use_container_width=True)
-
-    # 7. Energy Community Impact (New)
-    st.markdown("---")
-    st.subheader("☀️ Impacte Comunitat Energètica Local")
-    
-    # Identify self-consumers using Whitelist Only (User Request)
-    # Note: DF columns are Names (mapped), Whitelist is CUPS IDs. We must reverse map.
-    rev_map = {v: k for k, v in CUPS_MAPPING.items()}
-    clean_whitelist = [x.strip().upper() for x in COMMUNITY_PARTICIPANTS]
-    
-    all_cols = df.columns.get_level_values(0).unique()
-    self_cups = []
-    
-    for c in all_cols:
-        # Get Original CUPS ID from Name if possible, else use Name
-        original_id = rev_map.get(c, c) 
-        if str(original_id).strip().upper() in clean_whitelist:
-            self_cups.append(c)
-    
-    if not self_cups:
-        st.info("No s'han detectat dades d'autoconsum en aquests anys.")
-    else:
-        if source_mode == "Base de Dades (Supabase)":
-            # RPC MODE for Community Impact
-            total_self_year = 0
-            
-            # Whitelist IDs -> Names
-            whitelist_names = set()
-            for w_id in clean_whitelist:
-                 possible_name = CUPS_MAPPING.get(w_id, w_id) # ID -> Name
-                 whitelist_names.add(possible_name)
-
-            # Define Helper to sum Autocons from raw_target (RPC data)
-            def sum_autocons_rpc(rpc_data, allowed_names):
-                if not rpc_data: return 0, pd.Series(0.0, index=range(1, 13))
-                df_r = pd.DataFrame(rpc_data)
-                
-                # Filter for AUTOCONS
-                mask_auto = df_r['cups'].str.contains('AUTOCONS')
-                df_auto = df_r[mask_auto]
-                
-                if df_auto.empty: return 0, pd.Series(0.0, index=range(1, 13))
-                
-                # Filter by Whitelist Names
-                # keys are Name___AUTOCONS...
-                def is_allowed(k):
-                    parts = k.split("___")
-                    name = parts[0] if len(parts) > 1 else k.replace('_AE_AUTOCONS_kWh','') # rough fallback
-                    # Check partial match just in case
-                    # But ideally exact name
-                    return name in allowed_names
-                
-                df_auto = df_auto[df_auto['cups'].apply(is_allowed)]
-                
-                if df_auto.empty: return 0, pd.Series(0.0, index=range(1, 13))
-                
-                tot = df_auto['total_kwh'].sum()
-                df_auto['m'] = pd.to_datetime(df_auto['month']).dt.month
-                ser = df_auto.groupby('m')['total_kwh'].sum()
-                return tot, ser
-            
-            total_self_year, s_monthly_self = sum_autocons_rpc(raw_target, whitelist_names)
-            
-        else:
-            # LEGACY / DATAFRAME MODE
-            # Calculate Total Self Consumption for Target Year
-            total_self_year = 0
-            # Helper to get monthly self
-            s_monthly_self = pd.Series(0.0, index=range(1, 13)) 
-            
-            for c in self_cups:
-                 cols = df_target[c].columns
-                 auto_col = [x for x in cols if 'AUTOCONS' in x]
-                 if auto_col:
-                     col_data = df_target[c][auto_col[0]]
-                     total_self_year += col_data.sum()
-                     
-                     # Monthly
-                     resampled = col_data.resample('ME').sum()
-                     # Fill series 1..12
-                     for m in range(1, 13):
-                         sub = resampled[resampled.index.month == m]
-                         val = sub.sum() if not sub.empty else 0
-                         s_monthly_self[m] = s_monthly_self.get(m, 0) + val
- 
-        total_grid_year = total_target 
-        total_muni_demand = total_grid_year 
-        impact_pct = (total_self_year / total_muni_demand * 100) if total_muni_demand > 0 else 0
-        
-        # Prepare Chart Data
-        # Logic Update: Grid Column is Total. Self is part of it.
-        # We want to stack: Self (Gold) + Net Grid (Grey) = Total Grid (Height).
-        
-        s_total = df_chart[f"{target_year}"] # Only sums AE cols of involved cups
-        # Replace fill_vals since it's not defined in this scope.
-        # s_monthly_self is a Series indexed by Month (1..12)
-        s_self = [s_monthly_self.get(m, 0) for m in range(1, 13)]
-        
-        s_net_grid = []
-        for t, s in zip(s_total, s_self):
-            s_net_grid.append(max(0, t - s))
-
-        df_comm = pd.DataFrame({
-            "Mes": range(1, 13),
-            "Generació Solar": s_self,
-            "Xarxa (Facturat)": s_net_grid 
-        })
-        df_comm["NomMes"] = df_comm["Mes"].map(month_names)
-        
-        fig_comm = go.Figure()
-        fig_comm.add_trace(go.Bar(x=df_comm["NomMes"], y=df_comm["Generació Solar"], name="Autoconsum", marker_color="gold"))
-        # Stacked on top: Net Grid
-        fig_comm.add_trace(go.Bar(x=df_comm["NomMes"], y=df_comm["Xarxa (Facturat)"], name="Consum Total Ajuntament", marker_color="gray"))
-        
-        fig_comm.update_layout(title="Comparativa: Autoconsum vs Consum Total Ajuntament", xaxis={'categoryorder': 'array', 'categoryarray': list(month_names.values())}, barmode='stack')
-        st.plotly_chart(fig_comm, use_container_width=True)
-
-        # TABLE: Impact Data
-        st.markdown("##### 📄 Detall Mensual")
-        table_rows = []
-        for i, m_name in enumerate(df_comm["NomMes"]):
-            val_self = df_comm["Generació Solar"][i]
-            val_net = df_comm["Xarxa (Facturat)"][i]
-            val_total = val_self + val_net # Total Equipment
-            pct = (val_self / val_total * 100) if val_total > 0 else 0
-            
-            table_rows.append({
-                "Mes": m_name,
-                "Consum Total Ajuntament (kWh)": val_total,
-                "Autoconsum (kWh)": val_self,
-                "% Autoconsum": pct
-            })
-            
-        # Total Row
-        tot_self = sum(df_comm["Generació Solar"])
-        tot_net = sum(df_comm["Xarxa (Facturat)"])
-        tot_equip = tot_self + tot_net
-        tot_pct = (tot_self / tot_equip * 100) if tot_equip > 0 else 0
-        
-        table_rows.append({
-            "Mes": "**TOTAL ANY**",
-            "Consum Total Ajuntament (kWh)": tot_equip,
-            "Autoconsum (kWh)": tot_self,
-            "% Autoconsum": tot_pct
-        })
-        
-        df_impact_table = pd.DataFrame(table_rows)
-        st.table(df_impact_table.style.format({
-            "Consum Total Ajuntament (kWh)": "{:,.0f}",
-            "Autoconsum (kWh)": "{:,.0f}",
-            "% Autoconsum": "{:.1f}%"
-        }))
-
-    # 8. Sala Nova PV Summary (Database)
-    st.markdown("---")
-    st.header("☀️ Resum Fotovoltaica (Sala Nova)")
-    
-    try:
-        supa_client_rep = init_supabase()
-        resp_fv = supa_client_rep.table("FV_Sala_Nova").select("*").order("date").execute()
-        
-        if resp_fv.data:
-            df_fv_rep = pd.DataFrame(resp_fv.data)
-            df_fv_rep['date'] = pd.to_datetime(df_fv_rep['date'])
-            df_fv_rep.set_index('date', inplace=True)
-            
-            # Filter Target Year
-            df_fv_target = df_fv_rep[df_fv_rep.index.year == target_year]
-            
-            if not df_fv_target.empty:
-                # KPIs
-                total_gen = df_fv_target['potencia_fv'].sum()
-                
-                # Best Month
-                monthly_rep = df_fv_target['potencia_fv'].resample('ME').sum()
-                best_month_val = monthly_rep.max()
-                best_month_name = month_names.get(monthly_rep.idxmax().month, "-")
-                
-                c_pv1, c_pv2, c_pv3 = st.columns(3)
-                c_pv1.metric(f"Generació Total {target_year}", f"{total_gen:,.0f} kWh")
-                c_pv2.metric("Millor Mes", f"{best_month_name}", f"{best_month_val:,.0f} kWh")
-                c_pv3.metric("Estalvi Estimat (@0.15€)", f"{total_gen * 0.15:,.2f} €")
-                
-                # Chart
-                st.subheader(f"Producció Mensual {target_year}")
-                chart_data_fv = pd.DataFrame({"Mes": range(1, 13)})
-                
-                def fill_fv(series):
-                    vals = []
-                    for m in range(1, 13):
-                        subset = series[series.index.month == m]
-                        vals.append(subset.sum() if not subset.empty else 0)
-                    return vals
-                
-                chart_data_fv["kWh"] = fill_fv(monthly_rep)
-                chart_data_fv["NomMes"] = chart_data_fv["Mes"].map(month_names)
-                
-                fig_fv_rep = go.Figure()
-                fig_fv_rep.add_trace(go.Bar(x=chart_data_fv["NomMes"], y=chart_data_fv["kWh"], marker_color='#FFC300', name='Generació'))
-                fig_fv_rep.update_layout(title="Generació FV Mensual", yaxis_title="kWh")
-                st.plotly_chart(fig_fv_rep, use_container_width=True)
-                
-            else:
-                st.info(f"No hi ha dades fotovoltaiques per l'any {target_year}.")
-        else:
-            st.info("La base de dades FV és buida.")
-            
-    except Exception as e:
-        st.error(f"Error carregant dades FV: {e}")
-
-def detect_self_consumption_cups(df):
-    """
-    Identifies CUPS that have 'AE_AUTOCONS' (Self-Consumption) columns.
-    Returns a list of CUPS (names/ids as in columns level 0).
-    """
-    self_consumers = []
-    for c in df.columns.get_level_values(0).unique():
-        cols = df[c].columns
-        # Check if any column contains 'AUTOCONS'
-        if any('AUTOCONS' in col_var for col_var in cols):
-             self_consumers.append(c)
-    return self_consumers
+# Apply CSS
+apply_custom_styles()
 
 # --- Main App Interface ---
 
 def main():
-    st.title("Comptabilitat elèctrica Ajuntament de Sant Jordi Desvalls")
+    st.title('Comptabilitat elèctrica Ajuntament de Sant Jordi Desvalls')
     
     # Init Session State
-    if 'selected_cups_list' not in st.session_state: st.session_state.selected_cups_list = []
-    if 'anchor_date' not in st.session_state: st.session_state.anchor_date = datetime.date.today()
-    if 'user' not in st.session_state: st.session_state.user = None
+    init_session_state()
     
     # --- LOGIN FLOW ---
     if not st.session_state.user:
-        login_form()
+        render_login()
         return
     # ------------------
     
-    # Default View Mode: Anual
-    if 'view_mode' not in st.session_state: st.session_state.view_mode = 'Anual'
-    if 'view_mode_t1' not in st.session_state: st.session_state.view_mode_t1 = 'Anual'
-
-    # Sidebar
-    st.sidebar.write(f"👤 {st.session_state.user.email}")
-    if st.sidebar.button("Tancar Sessió"):
-        supabase = init_supabase()
-        supabase.auth.sign_out()
-        st.session_state.user = None
-        st.rerun()
-        
-    st.sidebar.divider()
+    # Sidebar & Data Source
+    # --- Mode Selection (Moved to Top for Context) ---
+    st.sidebar.markdown("---")
+    app_mode = st.sidebar.radio("Mode de Visualització", ["Expert", "Informe Executiu"], index=1)
     
-    # Data Source Selection
-    source_mode = st.sidebar.radio("Font de Dades", ["Base de Dades (Supabase)", "Pujar CSV Local (Processat)", "Importar Edistribucion (Originals)", "Huawei FusionSolar (Núvol)"], index=0)
+    # Render Sidebar (User info, Logout, and Source if Expert)
+    source_mode = render_sidebar(show_source_selector=(app_mode == 'Expert'))
+    if not source_mode: return
     
     df = None
     
@@ -1305,7 +57,7 @@ def main():
         uploaded_file = st.sidebar.file_uploader("Pujar CSV (Format Horari)", type=["csv"], help="Format: Datetime Index, Columnes=CUPS")
         if uploaded_file is not None:
              with st.spinner('Processant CSV...'):
-                 df = parse_data(uploaded_file)
+                 df = parse_processed_csv(uploaded_file)
              
              if df is not None:
                  st.write("---")
@@ -1331,13 +83,7 @@ def main():
                      if df is not None:
                          st.success(f"Processats {len(uploaded_files)} fitxers correctament!")
             
-            # If we simply want to process AND load, maybe we do it in one step or persistent state?
-            # Streamlit re-runs, so df will be lost unless stored.
-            # Let's simple approach: If files present, process immediately on load or allow button?
-            # Better UI: Process immediately to show preview (Parse is fast enough for small batches).
             if not st.session_state.get('edist_processed', False):
-                 # Auto-process if not heavy? 
-                 # Let's do it on the fly to populate 'df' variable so the rest of the app shows the preview.
                  with st.spinner("Llegint fitxers..."):
                      df = process_edistribucion_files(uploaded_files)
             
@@ -1353,372 +99,13 @@ def main():
                      help="Fusionar: Recomanat per afegir nous mesos."
                  )
                  
-                 if st.button("💾 Guardar a Base de Dades (Edistribucion)"):
+                 if st.button("💾 Guardar a Base de Dades (Originals)"):
                      mode_code = "replace" if "Esborrar" in upload_mode else "merge"
                      sync_csv_to_db(df, mode=mode_code)
-                     
-                     
-    elif source_mode == "Huawei FusionSolar (Núvol)":
+
+    else: # Base de Dades (Supabase)
         st.sidebar.markdown("---")
-        st.sidebar.subheader("🔌 Connexió FusionSolar")
-        
-        # Session State for Huawei
-        if 'huawei_user' not in st.session_state: st.session_state.huawei_user = "SantJordiDesvalls"
-        if 'huawei_pass' not in st.session_state: st.session_state.huawei_pass = "SantJordi1"
-        if 'huawei_token' not in st.session_state: st.session_state.huawei_token = None
-        
-        h_user = st.sidebar.text_input("Usuari", value=st.session_state.huawei_user)
-        h_pass = st.sidebar.text_input("Contrasenya", value=st.session_state.huawei_pass, type="password")
-        
-        # Connection Logic
-        if st.sidebar.button("Connectar"):
-            with st.spinner("Connectant..."):
-                client = HuaweiClient(h_user, h_pass)
-                if client.login():
-                    st.session_state.huawei_token = client.token
-                    # Store cookies for session persistence
-                    st.session_state.huawei_cookies = client.session.cookies
-                    st.sidebar.success("Connectat!")
-                    st.rerun()
-                else:
-                    st.sidebar.error("Error de connexió (Revisa credencials).")
-
-        # Working Context
-        if st.session_state.huawei_token:
-            # Reconstruct Client
-            client = HuaweiClient(h_user, h_pass)
-            client.token = st.session_state.huawei_token
-            client.session.headers.update({"XSRF-TOKEN": client.token})
-            if 'huawei_cookies' in st.session_state:
-                client.session.cookies = st.session_state.huawei_cookies
-
-            # Fetch Stations if not ready
-            if 'huawei_stations' not in st.session_state:
-                 with st.spinner("Obtenint llista de plantes..."):
-                     stations = client.get_station_list()
-                     if stations:
-                         st.session_state.huawei_stations = stations
-                     else:
-                         st.sidebar.warning("No s'han trobat plantes o token caducat.")
-            
-            stations = st.session_state.get('huawei_stations', [])
-            if stations:
-                st.sidebar.markdown("---")
-                # Debug Info Expander
-                with st.sidebar.expander("ℹ️ Detalls Tècnics (Debug)"):
-                     st.json(stations)
-                     
-                station_opts = {s['stationName']: s['stationCode'] for s in stations}
-                station_name = st.selectbox("Seleccionar Planta", list(station_opts.keys()))
-                station_code = station_opts[station_name]
-                
-                # Test Connection Button
-                if st.sidebar.button("📡 Test Dades Temps Real"):
-                     with st.spinner("Connectant a inversor..."):
-                         rt_data = client.get_station_real_kpi(station_code)
-                         if rt_data:
-                             st.sidebar.success("Connexió de Dades Correcta!")
-                             st.sidebar.json(rt_data)
-                         else:
-                             st.sidebar.error("No s'han rebut dades (Potser l'inversor està apagat/nit?)")
-
-                st.write("---")
-                col_d1, col_d2 = st.columns(2)
-                d_start = col_d1.date_input("Data Inici", datetime.date.today() - timedelta(days=7))
-                d_end = col_d2.date_input("Data Fi", datetime.date.today())
-                
-                debug_mode = st.sidebar.checkbox("Mode Debug (Veure Logs en pantalla)")
-
-                # Buttons
-                col_btn1, col_btn2 = st.columns(2)
-                
-                # --- OPTION 1: DAILY DATA (FAST) ---
-                if col_btn1.button("📅 Importar Dades DIÀRIES (Ràpid)"):
-                     if d_start > d_end:
-                         st.error("⚠️ La Data Inici no pot ser posterior a la Data Fi.")
-                         st.stop()
-                     
-                     with st.spinner("Descarregant dades diàries..."):
-                         all_daily = []
-                         
-                         debug_container = st.expander("Logs de Càrrega (Diari)", expanded=True)
-
-                         # Logic Update: It seems get_kpi_station_day returns data for a RANGE or Month?
-                         # The log showed a list of many days for a single request. 
-                         # Let's try sending just the start date (or iterate by months if needed, but start simply).
-                         
-                         # Current implementation loop: 
-                         # We will stick to the loop but check if the FIRST request already gave us everything.
-                         # If so, we break the loop to save time.
-                         
-                         delta = d_end - d_start
-                         days_range = delta.days + 1
-                         
-                         # Set of collected dates to avoid duplicates
-                         collected_dates = set()
-                         
-                         progress_bar = st.progress(0)
-                         
-                         # Smart Loop: Check if we already have the data
-                         for i in range(days_range):
-                             current_d = d_start + timedelta(days=i)
-                             current_d_str = current_d.strftime("%Y-%m-%d")
-                             
-                             if current_d_str in collected_dates:
-                                 debug_container.write(f"Dia {current_d} ja descarregat (Saltant petició).")
-                                 progress_bar.progress((i + 1) / days_range)
-                                 time.sleep(0.05) # Tiny sleep for UI update
-                                 continue # Already got this day from a previous bulk response
-                             
-                             ts = int(datetime.datetime.combine(current_d, datetime.time(0,0)).timestamp() * 1000)
-                             
-                             debug_container.write(f"Petició API per dia: {current_d}...")
-                             data_day = client.get_kpi_station_day(station_code, ts)
-                             
-                             if data_day and isinstance(data_day, list):
-                                 # This gives us a list of days. Let's process ALL of them.
-                                 # This gives us a list of days. Let's process ALL of them.
-                                 debug_container.write(f"Rebuts {len(data_day)} registres.")
-                                 debug_container.json(data_day) # Show full JSON logs
-                                 
-                                 for item in data_day:
-                                     # Add to result
-                                     all_daily.append(item)
-                                     
-                                     # Mark this date as collected
-                                     try:
-                                         item_ts = item.get('collectTime')
-                                         if item_ts:
-                                             d_obj = datetime.datetime.fromtimestamp(item_ts/1000).date()
-                                             collected_dates.add(d_obj.strftime("%Y-%m-%d"))
-                                     except: pass
-                             else:
-                                 debug_container.error(f"Error o sense dades per dia {current_d}: {data_day}")
-                             
-                             progress_bar.progress((i + 1) / days_range)
-                             time.sleep(5.0) # Wait 5s between requests to avoiding 407 (Strict) 
-                             
-                         progress_bar.empty()
-                         
-                         if all_daily:
-                             rows = []
-                             for item in all_daily:
-                                  try:
-                                     dt = datetime.datetime.fromtimestamp(item['collectTime']/1000)
-                                     # For daily, power might be "inverter_power" or similar, need check
-                                     # API Document says 'inverter_power' for yield
-                                     val = 0.0
-                                     map_data = item.get('dataItemMap', {})
-                                     if 'inverter_power' in map_data:
-                                         val = float(map_data['inverter_power'])
-                                     elif 'productPower' in item: 
-                                         val = float(item['productPower'])
-                                     elif 'productPower' in map_data:
-                                         val = float(map_data['productPower'])
-                                         
-                                     rows.append({
-                                         'reading_time': dt,
-                                         'CUPS': station_name,
-                                         'AE_AUTOCONS_kWh': val,
-                                         'AE_kWh': 0
-                                     })
-                                  except: continue
-                             
-                             if rows:
-                                 df_huawei = pd.DataFrame(rows)
-                                 # Ensure datetime index is set correctly
-                                 if 'reading_time' in df_huawei.columns:
-                                     # Drop duplicates if any (same day fetched twice)
-                                     df_huawei = df_huawei.drop_duplicates(subset=['reading_time', 'CUPS'])
-                                 
-                                 # ... Standard processing for DF (Pivot etc) ...
-                                 pivot = df_huawei.pivot_table(index='reading_time', columns='CUPS', values=['AE_kWh', 'AE_AUTOCONS_kWh'], aggfunc='sum')
-                                 pivot.columns = pivot.columns.swaplevel(0, 1)
-                                 pivot.columns.names = [None, None]
-                                 pivot.sort_index(axis=1, inplace=True)
-                                 pivot.index.name = 'Datetime'
-                                 pivot = pivot.fillna(0)
-                                 df = pivot
-                                 st.success(f"Dades Diàries obtingudes: {len(df)} registres.")
-                                 
-                                 # --- AUTO-SAVE TO FV_SALA_NOVA ---
-                                 try:
-                                     # Prepare payload from rows (already parsed)
-                                     fv_payload = []
-                                     for r in rows:
-                                         # r has 'reading_time' (datetime), 'AE_AUTOCONS_kWh' (val)
-                                         d_str = r['reading_time'].strftime("%Y-%m-%d")
-                                         val_fv = r['AE_AUTOCONS_kWh']
-                                         fv_payload.append({"date": d_str, "potencia_fv": val_fv})
-                                     
-                                     if fv_payload:
-                                         supa_client = init_supabase()
-                                         supa_client.table("FV_Sala_Nova").upsert(fv_payload, on_conflict="date").execute()
-                                         st.toast(f"Guardats {len(fv_payload)} registres a FV_Sala_Nova", icon="💾")
-                                 except Exception as e:
-                                     st.error(f"Error guardant a DB Sala Nova: {e}")
-                                     
-                             else: st.warning("No s'han trobat dades diàries.")
-                         else: st.error("Error obtenint dades diàries.")
-
-                # --- OPTION 2: HOURLY DATA (SLOW) ---
-                if col_btn2.button("⏱️ Importar Dades HORÀRIES (Lent)"):
-                    if d_start > d_end:
-                         st.error("⚠️ La Data Inici no pot ser posterior a la Data Fi.")
-                         st.stop()
-                    stop_button = st.empty()
-                    is_stopped = False
-                    
-                    debug_container = st.expander("Logs de Càrrega (Horari)", expanded=True)
-                    
-                    with st.spinner("Descarregant dades horàries... (Lent per evitar Errors 407)"):
-                         # Stop Button Logic
-                         # Streamlit stop button is tricky inside loop without rerun.
-                         # We use a placeholder but user has to press 'Stop' in sidebar maybe?
-                         # Or just warn user: "Pot trigar minuts".
-                         
-                         all_hourly = []
-                         # Interval Loop
-                         delta = d_end - d_start
-                         days_range = delta.days + 1
-                         
-                         if days_range > 20:
-                             st.error(f"⚠️ Risc de Quota Diària: Has seleccionat {days_range} dies.")
-                             st.error("El límit diari de Huawei és de ~25 peticions. Si us plau, selecciona blocs de màxim 20 dies.")
-                             st.stop()
-                         
-                         progress_text = st.empty()
-                         progress_bar = st.progress(0)
-                         
-                         for i in range(days_range):
-                             current_d = d_start + timedelta(days=i)
-                             progress_text.text(f"Descarregant dia {current_d}...")
-                             
-                             # Optimization: get_kpi_station_hour returns 24h list for the day!
-                             ts = int(datetime.datetime.combine(current_d, datetime.time(0,0)).timestamp() * 1000)
-                             
-                             debug_container.write(f"Baixant hores del dia: {current_d}...")
-                             data_hour = client.get_kpi_station_hour(station_code, ts)
-                             
-                             if data_hour and isinstance(data_hour, list):
-                                 debug_container.write(f"Rebuts {len(data_hour)} registres horaris.")
-                                 for item in data_hour:
-                                      item['collectTime'] = item.get('collectTime', ts)
-                                      all_hourly.append(item)
-                                  
-                                 # --- IMMEDIATE SAVE LOGIC ---
-                                 try:
-                                     day_payload = []
-                                     for item in data_hour:
-                                          # Re-parse simple for DB
-                                           ms = item.get('collectTime', ts)
-                                           dt_item = datetime.datetime.fromtimestamp(ms/1000)
-                                           val = 0.0
-                                           map_data = item.get('dataItemMap', {})
-                                           if 'inverter_power' in map_data: val = float(map_data['inverter_power'])
-                                           elif 'productPower' in item: val = float(item['productPower'])
-                                           elif 'productPower' in map_data: val = float(map_data['productPower'])
-                                           
-                                           # Only save positive values? Or 0s too? 0s are valid (night).
-                                           day_payload.append({"date": dt_item.strftime("%Y-%m-%d %H:%M:%S"), "potencia_fv": val})
-                                      
-                                     if day_payload:
-                                          # Let's SUM the hourly data for this day to update the DAILY reading.
-                                          daily_sum_val = sum([x['potencia_fv'] for x in day_payload])
-                                          d_str_day = current_d.strftime("%Y-%m-%d")
-                                          
-                                          supa_client = init_supabase()
-                                          # Upsert Daily Total
-                                          supa_client.table("FV_Sala_Nova").upsert([{"date": d_str_day, "potencia_fv": daily_sum_val}], on_conflict="date").execute()
-                                          debug_container.success(f"Guardat DB: {d_str_day} ({daily_sum_val:.2f} kWh)")
-                                           
-                                 except Exception as e:
-                                     debug_container.error(f"Error guardant parcial DB: {e}")
-
-                             else:
-                                 debug_container.error(f"Error dia {current_d}: {data_hour}")
-                                      
-
-                             # 65s Delay to respect Rate Limit (1 req/min)
-                             # Show countdown
-                             if i < days_range - 1: # Don't wait after last day
-                                 for s in range(65, 0, -1):
-                                     progress_text.text(f"⏳ Esperant {s}s per límit API (Huawei 407)...")
-                                     time.sleep(1)
-                                 # time.sleep(65.0)
-                         
-                         progress_text.empty()
-                         progress_bar.empty()
-                         
-                         if all_hourly:
-                             # Process Data
-                             rows = []
-                             for item in all_hourly:
-                                 try:
-                                     # collectTime is ms
-                                     dt = datetime.datetime.fromtimestamp(item['collectTime']/1000)
-                                     
-                                     # Field mapping: 'inverter_power' is standard in dataItemMap for yield
-                                     val = 0.0
-                                     map_data = item.get('dataItemMap', {})
-                                     
-                                     if 'inverter_power' in map_data:
-                                          val = float(map_data['inverter_power'])
-                                     elif 'productPower' in item:
-                                          val = float(item['productPower'])
-                                     elif 'productPower' in map_data:
-                                          val = float(map_data['productPower'])
-                                     
-                                     rows.append({
-                                         'reading_time': dt,
-                                         'CUPS': station_name, # Map Plant Name to CUPS column
-                                         'AE_AUTOCONS_kWh': val,
-                                         'AE_kWh': 0 # We don't get grid import here usually
-                                     })
-                                 except:
-                                     continue
-                             
-                             if rows:
-                                 df_huawei = pd.DataFrame(rows)
-                                 # Format to App Standard
-                                 pivot = df_huawei.pivot_table(index='reading_time', columns='CUPS', values=['AE_kWh', 'AE_AUTOCONS_kWh'], aggfunc='sum')
-                                 pivot.columns = pivot.columns.swaplevel(0, 1) # (CUPS, Var)
-                                 pivot.columns.names = [None, None]
-                                 pivot.sort_index(axis=1, inplace=True)
-                                 pivot.index.name = 'Datetime'
-                                 pivot = pivot.fillna(0)
-                                 
-                                 df = pivot
-                                 st.success(f"Dades obtingudes: {len(df)} hores.")
-                             else:
-                                 st.warning("Dades buides després del processament.")
-                         else:
-                             st.warning("No s'han rebut dades del servidor.")
-
-            if df is not None:
-                 st.write("---")
-                 st.markdown("##### ☁️ Configuració de Càrrega")
-                 st.dataframe(df.head())
-                 
-                 upload_mode = st.radio(
-                     "Mode de Sincronització", 
-                     ["Fusionar / Actualitzar", "⚠️ Esborrar Tot i Reemplaçar"],
-                     key="upload_mode_huawei",
-                     help="Fusionar: Recomanat per afegir nous dies."
-                 )
-                 
-                 if st.button("💾 Guardar a Base de Dades (Integrar)"):
-                     mode_code = "replace" if "Esborrar" in upload_mode else "merge"
-                     sync_csv_to_db(df, mode=mode_code)
-
-    else: # Database Mode
-        # LAZY LOADING LOGIC
         today = datetime.date.today()
-        
-        # Smart Default: Fetch Max Year from RPC
-        # If DB has no data, fallback to Current Year
-        # We can't reuse 'years' from main scope easily unless we fetch it here.
-        # Let's fetch quickly.
         
         try:
              client = init_supabase()
@@ -1730,30 +117,25 @@ def main():
              max_year_db = today.year
              min_year_db = today.year
              
-        # Default: FULL History (Min to Max) to allow navigation
         default_start = datetime.date(min_year_db, 1, 1)
         default_end = datetime.date(max_year_db, 12, 31)
         
-        # Sidebar Control for Range
-        with st.sidebar.expander("📅 Rang de Dades (DB)", expanded=False):
+        db_start = default_start
+        db_end = default_end
+        
+        if app_mode == 'Expert':
+            with st.sidebar.expander("📅 Rang de Dades (DB)", expanded=False):
              db_start = st.date_input("Inici", default_start)
              db_end = st.date_input("Fi", default_end)
              reload_btn = st.button("🔄 Actualitzar Dades")
              
-        # Initial Load or Reload
-        # We use st.cache_data to hold the DF unless parameters change
-        # But we need to handle the button press essentially as a trigger
-        
-        # Simple approach: Load based on inputs. Streamlit re-runs when inputs change.
-        # Check cache if same args
-        
         with st.spinner(f"Carregant dades ({db_start} - {db_end})..."):
              df = load_from_supabase_db(start_date=db_start, end_date=db_end)
 
         if df is None:
             st.info("La base de dades està buida o no s'han trobat dades en aquest rang.")
             st.info("Utilitza 'Pujar CSV Local' per carregar les primeres dades.")
-            
+
     if df is not None:
         # Standardize Index (ensure Datetime)
         if not isinstance(df.index, pd.DatetimeIndex):
@@ -1814,9 +196,9 @@ def main():
                 else:
                     st.info("Cap detectat.")
         
-        # --- Mode Selection ---
-        st.sidebar.divider()
-        app_mode = st.sidebar.radio("Mode de Visualització", ["Expert", "Informe Executiu"], index=1)
+        # --- Mode Selection (Already top) ---
+        # st.sidebar.divider()
+        # app_mode = st.sidebar.radio("Mode de Visualització", ["Expert", "Informe Executiu"], index=1)
 
         if app_mode == "Informe Executiu":
             render_executive_report(df, lighting_cups, building_cups, all_cups, source_mode=source_mode)
@@ -1860,7 +242,7 @@ def main():
             with col_nav1:
                  # View Mode
                  # Changed key to v2 to force reset of state
-                 mode = st.selectbox("Escala Temporal", ["Diària", "Setmanal", "Mensual", "Anual"], key="view_mode_t1_v2")
+                 mode = st.selectbox("Escala Temporal", ["Diària", "Setmanal", "Mensual", "Anual"], index=3, key="view_mode_t1_v2")
             
             with col_nav2:
                 # Navigation Buttons
@@ -2004,7 +386,7 @@ def main():
             st.markdown("---")
             col_c1, col_c2, col_c3 = st.columns([2, 1, 3])
             with col_c1:
-                mode_t2 = st.selectbox("Escala Temporal (Comparativa)", ["Diària", "Setmanal", "Mensual", "Anual"], key="mode_t2")
+                mode_t2 = st.selectbox("Escala Temporal (Comparativa)", ["Diària", "Setmanal", "Mensual", "Anual"], index=3, key="mode_t2")
             with col_c2:
                 col_cb1, col_cb2 = st.columns(2)
                 if col_cb1.button("⬅️", key="prev_t2"):
@@ -2421,11 +803,13 @@ def main():
                     day_series = day_data[view_cups][ae_col]
                     
                     fig_audit = go.Figure()
-                    fig_audit.add_trace(go.Scatter(x=day_series.index, y=day_series, name='Consum', fill='tozeroy', line=dict(color='#FF5733')))
+                    # Ensure index is naive to match sunrise/sunset
+                    plot_index = day_series.index.tz_localize(None)
+                    fig_audit.add_trace(go.Scatter(x=plot_index, y=day_series, name='Consum', fill='tozeroy', line=dict(color='#FF5733')))
                     
                     # Add background shading for Night
-                    fig_audit.add_vrect(x0=day_series.index[0], x1=sunrise, fillcolor="black", opacity=0.1, layer="below", line_width=0, annotation_text="Nit")
-                    fig_audit.add_vrect(x0=sunset, x1=day_series.index[-1], fillcolor="black", opacity=0.1, layer="below", line_width=0, annotation_text="Nit")
+                    fig_audit.add_vrect(x0=plot_index[0], x1=sunrise, fillcolor="black", opacity=0.1, layer="below", line_width=0, annotation_text="Nit")
+                    fig_audit.add_vrect(x0=sunset, x1=plot_index[-1], fillcolor="black", opacity=0.1, layer="below", line_width=0, annotation_text="Nit")
                     
                     # Force 1 hour ticks
                     fig_audit.update_layout(
@@ -2893,37 +1277,211 @@ def main():
             st.header("☀️ Producció Fotovoltaica - Sala Nova (Base de Dades)")
             
             try:
+                # 1. Load Data
                 supa_client = init_supabase()
-                resp = supa_client.table("FV_Sala_Nova").select("*").order("date").execute()
-                data_fv = resp.data
+                # Use Global Chunked Helper
+                data_fv = fetch_fv_data_chunked(chunk_size=1000)
                 
                 if data_fv:
                     df_fv = pd.DataFrame(data_fv)
-                    df_fv['date'] = pd.to_datetime(df_fv['date'])
-                    df_fv.set_index('date', inplace=True)
+                    df_fv['reading_time'] = pd.to_datetime(df_fv['reading_time'])
+                    df_fv.set_index('reading_time', inplace=True)
                     df_fv = df_fv.sort_index()
                     
-                    for i, r in df_fv.iterrows():
-                       # df_fv rows logic
-                       pass
+                    # 2. Controls and State Management
+                    if 't6_anchor_date' not in st.session_state:
+                         st.session_state['t6_anchor_date'] = datetime.date.today()
 
-                    # KPIs
-                    last_date = df_fv.index.max().date()
-                    total_energy = df_fv['potencia_fv'].sum()
-                    last_val = df_fv['potencia_fv'].iloc[-1]
+                    c_ctrl1, c_nav1, c_nav2, c_nav3 = st.columns([2, 1, 3, 1])
+                    with c_ctrl1:
+                        # Time Scale Selector
+                        time_scale = st.selectbox(
+                            "Escala Temporal", 
+                            ["Anual", "Mensual", "Setmanal", "Diària"], 
+                            index=0,
+                            key='t6_scale_selector'
+                        )
                     
-                    k1, k2, k3 = st.columns(3)
-                    k1.metric("Total Acumulat (Històric)", f"{total_energy:,.1f} kWh")
-                    k2.metric("Última Lectura", f"{last_val:.2f} kWh", f"{last_date}")
-                    k3.metric("Registres", len(df_fv))
+                    # Logic: Determine Shift Delta based on Scale
+                    from dateutil.relativedelta import relativedelta
+
+                    shift_delta = relativedelta(years=1)
+                    if time_scale == "Mensual": shift_delta = relativedelta(months=1)
+                    elif time_scale == "Setmanal": shift_delta = relativedelta(weeks=1)
+                    elif time_scale == "Diària": shift_delta = relativedelta(days=1)
+
+                    with c_nav1:
+                        st.write("") # Spacer
+                        if st.button("⬅️ Enrere", key="t6_prev"):
+                            st.session_state['t6_anchor_date'] -= shift_delta
+                            
+                    with c_nav3:
+                        st.write("") # Spacer
+                        if st.button("Endavant ➡️", key="t6_next"):
+                            st.session_state['t6_anchor_date'] += shift_delta
+                            
+                    # Calculate Date Range for Filtering
+                    anchor = st.session_state['t6_anchor_date']
+                    start_view = anchor
+                    end_view = anchor 
+                    title_view = str(anchor)
+                    resample_freq = 'ME'
+
+                    if time_scale == "Anual":
+                         start_view = datetime.date(anchor.year, 1, 1)
+                         end_view = datetime.date(anchor.year, 12, 31)
+                         resample_freq = 'ME'
+                         title_view = f"Any {anchor.year}"
+                         
+                    elif time_scale == "Mensual":
+                         start_view = datetime.date(anchor.year, anchor.month, 1)
+                         next_m = start_view + relativedelta(months=1)
+                         end_view = next_m - timedelta(days=1)
+                         resample_freq = 'd'
+                         title_view = f"{month_names.get(anchor.month, anchor.month)} {anchor.year}"
+                         
+                    elif time_scale == "Setmanal":
+                         start_view = anchor - timedelta(days=anchor.weekday())
+                         end_view = start_view + timedelta(days=6)
+                         resample_freq = 'd'
+                         title_view = f"Setmana {start_view.strftime('%d/%m')} - {end_view.strftime('%d/%m/%Y')}"
+                         
+                    elif time_scale == "Diària":
+                         start_view = anchor
+                         end_view = anchor
+                         resample_freq = 'h'
+                         title_view = f"{anchor.strftime('%d/%m/%Y')}"
+
+                    with c_nav2:
+                         st.markdown(f"<h3 style='text-align: center; margin-top: 5px;'>{title_view}</h3>", unsafe_allow_html=True)
+
+                    # Filter PV Data
+                    mask_fv = (df_fv.index.date >= start_view) & (df_fv.index.date <= end_view)
+                    df_fv_filtered = df_fv[mask_fv]
                     
-                    st.markdown("##### 📅 Producció Diària")
-                    st.bar_chart(df_fv['potencia_fv'], color="#FFC300")
+                    # Resample PV Data
+                    s_fv_resampled = df_fv_filtered['potencia_fv'].resample(resample_freq).sum() if not df_fv_filtered.empty else pd.Series()
+                    if s_fv_resampled.empty:
+                         # Create specific empty index for plot structure
+                         # This avoids "No data" generic error if possible, shows empty chart
+                         pass
                     
-                    # By Month
-                    st.markdown("##### 🗓️ Producció Mensual")
-                    monthly_fv = df_fv['potencia_fv'].resample('ME').sum()
-                    st.bar_chart(monthly_fv, color="#FF5733")
+                    # 3. Chart 1: General PV Production
+                    st.subheader(f"Generació Fotovoltaica ({time_scale})")
+                    
+                    fig_gen = go.Figure()
+                    
+                    # Determine Chart Type based on Scale
+                    # Hourly/Daily usually Bar? Evolution usually Bar if discrete periods.
+                    # Solar curve (Daily) nice as Area/Line.
+                    chart_type = 'bar'
+                    if time_scale == "Diària": chart_type = 'area' # Solar curve style
+                    
+                    if not s_fv_resampled.empty:
+                        if chart_type == 'area':
+                             fig_gen.add_trace(go.Scatter(
+                                x=s_fv_resampled.index, 
+                                y=s_fv_resampled, 
+                                name="Producció FV",
+                                fill='tozeroy',
+                                line=dict(color='#FFC300')
+                             ))
+                        else:
+                             fig_gen.add_trace(go.Bar(
+                                x=s_fv_resampled.index, 
+                                y=s_fv_resampled, 
+                                name="Producció FV",
+                                marker_color='#FFC300'
+                             ))
+                    else:
+                        st.warning(f"No hi ha dades per al període: {title_view}")
+                    
+                    fig_gen.update_layout(
+                        title=f"Producció FV - {title_view}",
+                        xaxis_title="Temps",
+                        yaxis_title="kWh",
+                        hovermode="x unified"
+                    )
+                    st.plotly_chart(fig_gen, use_container_width=True)
+                    
+                    # 4. Chart 2: Comparativa vs Community Demand
+                    st.markdown("---")
+                    st.subheader("Comparativa: Producció vs Demanda Comunitat")
+                    
+                    # Check if 'df' (Consumption) is available
+                    if df is not None and not df.empty:
+                        # Identify Community CUPS
+                        rev_map_local = {v: k for k, v in CUPS_MAPPING.items()}
+                        clean_whitelist = [x.strip().upper() for x in COMMUNITY_PARTICIPANTS]
+                        
+                        community_consumption_cups = []
+                        all_cols_idx = df.columns.get_level_values(0).unique()
+                        for c in all_cols_idx:
+                            cid = rev_map_local.get(c, c)
+                            if str(cid).strip().upper() in clean_whitelist:
+                                community_consumption_cups.append(c)
+                        
+                        if community_consumption_cups:
+                            # Filter and Aggregate Consumption
+                            mask_df = (df.index.date >= start_view) & (df.index.date <= end_view)
+                            df_filtered_view = df.loc[mask_df]
+                            
+                            ts_comm_demand = pd.Series(0.0, index=df_filtered_view.index)
+                            
+                            if not df_filtered_view.empty:
+                                for c in community_consumption_cups:
+                                    cols = df_filtered_view[c].columns
+                                    # AE = Grid Consumption. Total = Grid + Self-Consumed.
+                                    
+                                    ae_col = [x for x in cols if 'AE' in x and 'kWh' in x and 'AUTOCONS' not in x]
+                                    auto_col = [x for x in cols if 'AE' in x and 'kWh' in x and 'AUTOCONS' in x]
+                                    
+                                    if ae_col: ts_comm_demand = ts_comm_demand.add(df_filtered_view[c][ae_col[0]], fill_value=0)
+                                    if auto_col: ts_comm_demand = ts_comm_demand.add(df_filtered_view[c][auto_col[0]], fill_value=0)
+                            
+                            # Resample Consumption
+                            # Use correct filtered DF freq or new freq?
+                            # freq is global for this tab from 'time_scale'
+                            # resample_freq was calculated earlier
+                            
+                            s_comm_resampled = ts_comm_demand.resample(resample_freq).sum() if not ts_comm_demand.empty else pd.Series()
+                            
+                            fig_comp_comm = go.Figure()
+                            
+                            # Trace 1: Demand (Area/Line)
+                            if not s_comm_resampled.empty:
+                                fig_comp_comm.add_trace(go.Scatter(
+                                    x=s_comm_resampled.index,
+                                    y=s_comm_resampled,
+                                    name="Demanda Comunitat",
+                                    mode='lines',
+                                    fill='tozeroy',
+                                    line=dict(color='gray', width=1),
+                                    fillcolor='rgba(128, 128, 128, 0.2)'
+                                ))
+
+                            
+                            # Trace 2: Generation (Line/Bar)
+                            fig_comp_comm.add_trace(go.Scatter(
+                                x=s_fv_resampled.index,
+                                y=s_fv_resampled,
+                                name="Producció FV Sala Nova",
+                                line=dict(color='#FFC300', width=2)
+                            ))
+                            
+                            fig_comp_comm.update_layout(
+                                title=f"Cobertura de Demanda ({time_scale})",
+                                xaxis_title="Temps",
+                                yaxis_title="kWh",
+                                hovermode="x unified",
+                                legend=dict(orientation="h", y=1.1)
+                            )
+                            st.plotly_chart(fig_comp_comm, use_container_width=True)
+                            
+                        else:
+                             st.warning("No s'han trobat CUPS de la comunitat a les dades de consum carregades.")
+                    else:
+                        st.info("Carrega dades de consum (CSV/DB) per veure la comparativa de demanda.")
                     
                 else:
                     st.info("Encara no hi ha dades a la taula FV_Sala_Nova.")
