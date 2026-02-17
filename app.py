@@ -11,7 +11,7 @@ import time
 
 # --- MODULAR IMPORTS ---
 from src.core.config import CUPS_MAPPING, COMMUNITY_PARTICIPANTS, month_names, month_names_short, PAGE_TITLE, PAGE_ICON, apply_custom_styles
-from src.core.database import init_supabase, fetch_fv_data_chunked, load_from_supabase_db, sync_csv_to_db
+from src.core.database import init_supabase, load_fv_sala_nova_data, load_from_supabase_db, sync_csv_to_db
 from src.ui.layout import render_login, render_sidebar, init_session_state
 from src.ui.views.executive import render_executive_report
 from src.utils.parsers import parse_processed_csv, process_edistribucion_files
@@ -1279,14 +1279,10 @@ def main():
             try:
                 # 1. Load Data
                 supa_client = init_supabase()
-                # Use Global Chunked Helper
-                data_fv = fetch_fv_data_chunked(chunk_size=1000)
+                # Use Global Cached Function (Optimized)
+                df_fv = load_fv_sala_nova_data()
                 
-                if data_fv:
-                    df_fv = pd.DataFrame(data_fv)
-                    df_fv['reading_time'] = pd.to_datetime(df_fv['reading_time'])
-                    df_fv.set_index('reading_time', inplace=True)
-                    df_fv = df_fv.sort_index()
+                if not df_fv.empty:
                     
                     # 2. Controls and State Management
                     if 't6_anchor_date' not in st.session_state:

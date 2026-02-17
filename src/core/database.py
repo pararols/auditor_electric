@@ -15,31 +15,44 @@ def init_supabase():
 
 # --- Data Fetching Helpers ---
 
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_fv_data_chunked(start_date=None, end_date=None, chunk_size=1000):
-    """Fetches FV_Sala_Nova data using pagination to bypass row limits."""
+@st.cache_data(ttl=3600, show_spinner="Carregant dades FV...")
+def load_fv_sala_nova_data():
+    """Fetches and processes FV_Sala_Nova data, returning a ready-to-use DataFrame."""
     client = init_supabase()
-    if not client: return []
+    if not client: return pd.DataFrame()
     
     all_rows = []
+    chunk_size = 2000 # Increased chunk size for faster batching
     offset = 0
     
     while True:
-        q = client.table("FV_Sala_Nova").select("*").order("reading_time")
-        if start_date:
-            q = q.filter("reading_time", "gte", start_date)
-        if end_date:
-            q = q.filter("reading_time", "lte", end_date)
-            
-        res = q.range(offset, offset + chunk_size - 1).execute()
+        # Fetch only necessary columns to reduce payload
+        res = client.table("FV_Sala_Nova").select("*").order("reading_time").range(offset, offset + chunk_size - 1).execute()
+        
         if not res.data: break
         
         all_rows.extend(res.data)
+        
         if len(res.data) < chunk_size: break
         offset += chunk_size
-        if offset > 100000: break # Safety brake
+        if offset > 200000: break # Safety brake
         
-    return all_rows
+    if not all_rows:
+        return pd.DataFrame()
+        
+    # Process DataFrame inside the cache
+    df = pd.DataFrame(all_rows)
+    # Ensure reading_time is datetime
+    df['reading_time'] = pd.to_datetime(df['reading_time'])
+    
+    # Check for timezone and remove if present (to match app logic)
+    if df['reading_time'].dt.tz is not None:
+        df['reading_time'] = df['reading_time'].dt.tz_localize(None)
+        
+    df.set_index('reading_time', inplace=True)
+    df.sort_index(inplace=True)
+    
+    return df
 
 def load_from_supabase_db(start_date=None, end_date=None):
     """Fetch readings from 'energy_readings_wide' (JSONB optimized format)."""
