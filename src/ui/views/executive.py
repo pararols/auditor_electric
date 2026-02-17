@@ -4,7 +4,7 @@ import plotly.graph_objects as go
 import datetime
 from datetime import timedelta
 from ...core.config import month_names, month_names_short, CUPS_MAPPING, COMMUNITY_PARTICIPANTS
-from ...core.database import init_supabase, fetch_fv_data_chunked
+from ...core.database import init_supabase, load_fv_sala_nova_data
 
 def fetch_year_sums_rpc(year):
     """Fetches monthly sums for a specific year via RPC."""
@@ -319,12 +319,11 @@ def render_executive_report(df, lighting_cups, building_cups, all_cups, source_m
     st.markdown("---")
     st.header("☀️ Producció Fotovoltaica Sala Nova")
     try:
-        data_fv = fetch_fv_data_chunked()
-        if data_fv:
-            df_fv = pd.DataFrame(data_fv)
-            df_fv['reading_time'] = pd.to_datetime(df_fv['reading_time'])
-            df_fv_target = df_fv[df_fv['reading_time'].dt.year == target_year]
-            df_fv_prev = df_fv[df_fv['reading_time'].dt.year == prev_year]
+        df_fv = load_fv_sala_nova_data()
+        if not df_fv.empty:
+            # df_fv already has datetime index 'reading_time'
+            df_fv_target = df_fv[df_fv.index.year == target_year]
+            df_fv_prev = df_fv[df_fv.index.year == prev_year]
             
             if not df_fv_target.empty:
                 gen_target = df_fv_target['potencia_fv'].sum()
@@ -334,8 +333,8 @@ def render_executive_report(df, lighting_cups, building_cups, all_cups, source_m
                 c1.metric(f"Producció {target_year}", f"{gen_target:,.0f} kWh", delta_str(gen_target, gen_prev))
                 
                 # Monthly split
-                m_gen_target = df_fv_target.groupby(df_fv_target['reading_time'].dt.month)['potencia_fv'].sum().reindex(range(1,13), fill_value=0.0)
-                m_gen_prev = df_fv_prev.groupby(df_fv_prev['reading_time'].dt.month)['potencia_fv'].sum().reindex(range(1,13), fill_value=0.0)
+                m_gen_target = df_fv_target.groupby(df_fv_target.index.month)['potencia_fv'].sum().reindex(range(1,13), fill_value=0.0)
+                m_gen_prev = df_fv_prev.groupby(df_fv_prev.index.month)['potencia_fv'].sum().reindex(range(1,13), fill_value=0.0)
                 
                 best_m = m_gen_target.idxmax()
                 c2.metric("Millor Mes", month_names.get(best_m, str(best_m)), f"{m_gen_target.max():,.0f} kWh")
