@@ -22,7 +22,7 @@ def load_fv_sala_nova_data():
     if not client: return pd.DataFrame()
     
     all_rows = []
-    chunk_size = 2000 # Increased chunk size for faster batching
+    chunk_size = 1000 # Match API limit to ensure pagination works
     offset = 0
     
     while True:
