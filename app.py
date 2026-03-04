@@ -226,61 +226,38 @@ def main():
         # --- Tabs ---
         tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📊 Panell Global", "📈 Comparativa", "🌃 Auditor Enllumenat", "🤖 AI Advisor", "☀️ Autoconsum", "☀️ FV Sala Nova"])
         
-        # === TAB 1: Global Dashboard ===
-        with tab1:
-            st.header("Visió General")
-            # (Logic Continues...) Same as before roughly, just careful with indentation/structure if I overwrite heavily.
-            # Actually I am overwriting `main` start.
-            pass 
-        # I must stop here because replace needs exact match. 
-        # I will target up to "with tab1:" and rely on the fact that existing code follows.
-
-            
+        @st.fragment
+        def render_tab_global(df_data, cups_list):
             # 1. Controls Row
             col_nav1, col_nav2, col_nav3 = st.columns([2, 1, 3])
             
             with col_nav1:
-                 # View Mode
-                 # Changed key to v2 to force reset of state
-                 mode = st.selectbox("Escala Temporal", ["Diària", "Setmanal", "Mensual", "Anual"], index=3, key="view_mode_t1_v2")
+                 mode = st.selectbox("Escala Temporal", ["Diària", "Setmanal", "Mensual", "Anual"], index=3, key="view_mode_t1_frag")
             
             with col_nav2:
-                # Navigation Buttons
                 col_b1, col_b2 = st.columns(2)
-                if col_b1.button("⬅️", key="prev_t1"):
+                if col_b1.button("⬅️", key="prev_t1_frag"):
                     st.session_state.anchor_date = shift_date(mode, st.session_state.anchor_date, -1)
-                if col_b2.button("➡️", key="next_t1"):
+                if col_b2.button("➡️", key="next_t1_frag"):
                     st.session_state.anchor_date = shift_date(mode, st.session_state.anchor_date, 1)
 
-            # Calculate Date Range
             start_d, end_d, freq_alias = get_date_range(mode, st.session_state.anchor_date)
             
             with col_nav3:
                 st.subheader(f"📅 {start_d} - {end_d}")
 
             # 2. Filter Data based on time
-            # Filter rows
-            mask_time = (df.index.date >= start_d) & (df.index.date <= end_d)
-            df_filtered_t1 = df.loc[mask_time]
+            mask_time = (df_data.index.date >= start_d) & (df_data.index.date <= end_d)
+            df_filtered_t1 = df_data.loc[mask_time]
             
-            # Filter columns (Using 'All' implicitly for Global view, or let user filter?)
-            # Global view usually implies everything, but user might want to see specific aggregate
-            # Let's add basic CUPS filter here too or just use ALL?
-            # User asked for "Visio General" simply. Let's aggregate ALL selected cups from session state if relevant,
-            # but usually global implies Site Total. Let's use the Session State list to allow flexibility.
-            
-            # --- Quick Selectors (re-used logic visually, but maybe less prominent here?) 
-            # User asked specifically for these buttons in Comparative, but implied flexibility in Global.
-            # Let's put a Multiselect here for Global Aggregation.
-            
-            selected_cups_t1 = st.multiselect("Filtrar CUPS (Agregat)", all_cups, default=all_cups, key="sel_cups_t1")
+            selected_cups_t1 = st.multiselect("Filtrar CUPS (Agregat)", cups_list, default=cups_list, key="sel_cups_t1_frag")
             
             # Aggregation
-            # Helper to get AE and Self-Consumption for selected CUPS
-            def get_aggregated_data(data_df, cups_list):
+            def get_aggregated_data(data_df, c_list):
                 total_ae = pd.Series(0, index=data_df.index)
                 total_autocons = pd.Series(0, index=data_df.index)
-                for cups in cups_list:
+                for cups in c_list:
+                    if cups not in data_df.columns.get_level_values(0): continue
                     cols = data_df[cups].columns
                     ae_col = [c for c in cols if 'AE' in c and 'kWh' in c and 'AUTOCONS' not in c]
                     autocons_col = [c for c in cols if 'AUTOCONS' in c]
@@ -291,17 +268,12 @@ def main():
             agg_ae, agg_autocons = get_aggregated_data(df_filtered_t1, selected_cups_t1)
             
             # 3. Display KPIs & Chart
-            if not agg_ae.empty:
+            if not agg_ae.empty and agg_ae.sum() > 0:
                 kpi1, kpi2, kpi3 = st.columns(3)
                 kpi1.metric("Consum Xarxa", f"{agg_ae.sum():,.2f} kWh")
                 kpi2.metric("Autoconsum", f"{agg_autocons.sum():,.2f} kWh")
                 total_demand = agg_ae.sum() + agg_autocons.sum()
                 kpi3.metric("Autosuficiència", f"{(agg_autocons.sum()/total_demand*100 if total_demand > 0 else 0):.2f} %")
-                
-                # Resample for Chart
-                # If freq_alias == '1h' (Daily view), keep as is.
-                # If '1d' (Weekly/Monthly), resample sum.
-                # If 'ME' (Yearly), resample sum.
                 
                 chart_ae = agg_ae
                 chart_ac = agg_autocons
@@ -310,17 +282,12 @@ def main():
                     chart_ae = agg_ae.resample(freq_alias).sum()
                     chart_ac = agg_autocons.resample(freq_alias).sum()
                     
-                # --- ENFORCE FULL GRANULARITY (User Request) ---
-                # Ensure we show all expected points (e.g. 12 months) even if data is missing
                 full_idx = None
                 if mode == 'Anual':
-                     # Force 12 Months (Month End to match resample 'ME')
-                     # start_d is Jan 1. date_range 'ME' gives Jan 31, Feb 28...
                      full_idx = pd.date_range(start=start_d, end=end_d, freq='ME') 
                 elif mode == 'Mensual' or mode == 'Setmanal':
                      full_idx = pd.date_range(start=start_d, end=end_d, freq='D')
                 elif mode == 'Diària':
-                     # start_d is date. We need 24h.
                      full_idx = pd.date_range(start=start_d, periods=24, freq='h')
                 
                 if full_idx is not None:
@@ -333,13 +300,12 @@ def main():
                 if agg_autocons.sum() > 0:
                      fig_line.add_trace(go.Bar(x=chart_ac.index, y=chart_ac, name='Autoconsum', marker_color='#00CC96') if freq_alias != '1h' else go.Scatter(x=chart_ac.index, y=chart_ac, name='Autoconsum', line=dict(color='#00CC96'), fill='tozeroy'))
 
-                # Determine dtick for x-axis based on view mode
                 xaxis_args = {'title': "Temps"}
                 if mode == 'Diària':
-                    xaxis_args['dtick'] = 3600000 * 1 # 1 hour in ms
+                    xaxis_args['dtick'] = 3600000 * 1 
                     xaxis_args['tickformat'] = "%H:%M"
                 elif mode == 'Setmanal':
-                    xaxis_args['dtick'] = 86400000.0 # 1 day
+                    xaxis_args['dtick'] = 86400000.0 
                     xaxis_args['tickformat'] = "%d/%m"
                 elif mode == 'Mensual':
                      xaxis_args['dtick'] = 86400000.0 
@@ -352,6 +318,11 @@ def main():
                 st.plotly_chart(fig_line, use_container_width=True)
             else:
                 st.warning("Sense dades per aquest període/selecció.")
+
+        # === TAB 1: Global Dashboard ===
+        with tab1:
+            st.header("Visió General")
+            render_tab_global(df, all_cups)
 
         # === TAB 2: Comparative Analysis ===
         with tab2:
@@ -382,16 +353,37 @@ def main():
             
             # 2. Controls (Time) - Independent from Tab 1? 
             # It's better to share Anchor Date usually, but maybe distinctive Modes.
-            # Let's reuse the same anchor date principle for consistency.
+        @st.fragment
+        def render_tab_comparative(df_data, cups_list, lighting_c, building_c):
+            # 1. Quick Selectors
+            col_btn1, col_btn2, col_btn3, col_btn4 = st.columns(4)
+            
+            def update_selection(new_list):
+                st.session_state["multi_comp"] = new_list
+            
+            if col_btn1.button("Tots (All)", key="btn_all"): 
+                update_selection(cups_list)
+            if col_btn2.button("Enllumenat", key="btn_light"): 
+                update_selection(lighting_c)
+            if col_btn3.button("Edificis (Resta)", key="btn_build"): 
+                update_selection(building_c)
+            if col_btn4.button("Netejar", key="btn_clear"): 
+                update_selection([])
+            
+            if "multi_comp" not in st.session_state:
+                 st.session_state["multi_comp"] = cups_list
+            
+            current_selection = st.multiselect("CUPS Seleccionats", cups_list, key="multi_comp")
+            
             st.markdown("---")
             col_c1, col_c2, col_c3 = st.columns([2, 1, 3])
             with col_c1:
-                mode_t2 = st.selectbox("Escala Temporal (Comparativa)", ["Diària", "Setmanal", "Mensual", "Anual"], index=3, key="mode_t2")
+                mode_t2 = st.selectbox("Escala Temporal (Comparativa)", ["Diària", "Setmanal", "Mensual", "Anual"], index=3, key="mode_t2_frag")
             with col_c2:
                 col_cb1, col_cb2 = st.columns(2)
-                if col_cb1.button("⬅️", key="prev_t2"):
+                if col_cb1.button("⬅️", key="prev_t2_frag"):
                     st.session_state.anchor_date = shift_date(mode_t2, st.session_state.anchor_date, -1)
-                if col_cb2.button("➡️", key="next_t2"):
+                if col_cb2.button("➡️", key="next_t2_frag"):
                      st.session_state.anchor_date = shift_date(mode_t2, st.session_state.anchor_date, 1)
             
             start_d2, end_d2, freq_alias2 = get_date_range(mode_t2, st.session_state.anchor_date)
@@ -400,29 +392,21 @@ def main():
                  st.subheader(f"📅 {start_d2} - {end_d2}")
                  
             # 3. Bar Chart (Stacked by CUPS)
-            # Filter time
-            mask_time2 = (df.index.date >= start_d2) & (df.index.date <= end_d2)
-            df_filtered_t2 = df.loc[mask_time2]
+            mask_time2 = (df_data.index.date >= start_d2) & (df_data.index.date <= end_d2)
+            df_filtered_t2 = df_data.loc[mask_time2]
             
             if not df_filtered_t2.empty and current_selection:
-                # Prepare Data for Plotly Express
-                # We need a long-format DF: [Datetime, CUPS, kWh]
-                # Loop selected cups
                 plot_data = []
-                
                 for cup in current_selection:
-                    # Get AE col
+                    if cup not in df_filtered_t2.columns.get_level_values(0): continue
                     cols = df_filtered_t2[cup].columns
                     ae_col = [c for c in cols if 'AE' in c and 'kWh' in c and 'AUTOCONS' not in c]
                     
                     if ae_col:
                         series = df_filtered_t2[cup][ae_col[0]]
-                        
-                        # Resample if needed
                         if freq_alias2 != 'h':
                             series = series.resample(freq_alias2).sum()
                         
-                        # Create small DF
                         tmp = series.reset_index()
                         tmp.columns = ['Datetime', 'kWh']
                         tmp['CUPS'] = cup
@@ -430,17 +414,12 @@ def main():
                 
                 if plot_data:
                     final_plot_df = pd.concat(plot_data)
-                    
                     fig_bar = px.bar(
-                        final_plot_df, 
-                        x='Datetime', 
-                        y='kWh', 
-                        color='CUPS', 
+                        final_plot_df, x='Datetime', y='kWh', color='CUPS', 
                         title=f"Consum Desglossat ({mode_t2})",
                         text_auto='.2s' if len(current_selection) < 5 else False
                     )
                     
-                    # Axis settings for bar chart
                     xaxis_args2 = {'title': "Temps"}
                     if mode_t2 == 'Diària':
                         xaxis_args2['dtick'] = 3600000 * 1
@@ -462,151 +441,129 @@ def main():
             else:
                 st.info("Selecciona rang i CUPS per visualitzar.")
                 
-            # 4. Flexible Comparison Chart (Series)
+            # 4. Flexible Comparison Chart
             st.subheader("Comparativa de Sèries (Tendències)")
-            
-            # Custom container for controls
             col_sel, col_res = st.columns([4, 1])
+            comp_options = ["TOTAL", "ENLLUMENAT (Agregat)", "EDIFICIS (Agregat)"] + sorted(cups_list)
             
-            # Define Options
-            comp_options = ["TOTAL", "ENLLUMENAT (Agregat)", "EDIFICIS (Agregat)"] + sorted(all_cups)
-            
-            # Session state for this specific selector
             if "comp_series_sel" not in st.session_state:
                 st.session_state.comp_series_sel = ["TOTAL"]
                 
-            # Reset Button logic
-            if col_res.button("Restablir (Total)", key="btn_reset_comp"):
+            if col_res.button("Restablir (Total)", key="btn_reset_comp_frag"):
                 st.session_state.comp_series_sel = ["TOTAL"]
             
-            # Multiselect
-            selection_series = col_sel.multiselect("Afegir/Treure Sèries al Gràfic", comp_options, key="series_multiselect", default=st.session_state.comp_series_sel)
+            selection_series = col_sel.multiselect("Afegir/Treure Sèries al Gràfic", comp_options, key="series_multiselect_frag", default=st.session_state.comp_series_sel)
             
-            # Year Selector for Comparison
-            available_years = sorted(df.index.year.unique())
+            available_years = sorted(df_data.index.year.unique())
             col_y_sel, _ = st.columns([2, 3])
-            selected_years_comp = col_y_sel.multiselect("Seleccionar Anys a Comparar", available_years, default=available_years, key="years_comp_sel")
+            selected_years_comp = col_y_sel.multiselect("Seleccionar Anys a Comparar", available_years, default=available_years, key="years_comp_sel_frag")
 
-            # Plotting Logic
+            # Helper specifically for comparative fallback mode
+            def get_aggregated_data_comp(data_df, c_list):
+                total_ae = pd.Series(0, index=data_df.index)
+                for cups in c_list:
+                    if cups not in data_df.columns.get_level_values(0): continue
+                    cols = data_df[cups].columns
+                    ae_col = [c for c in cols if 'AE' in c and 'kWh' in c and 'AUTOCONS' not in c]
+                    if ae_col: total_ae = total_ae.add(data_df[cups][ae_col[0]], fill_value=0)
+                return total_ae, None
+
             if selection_series:
                 fig_comp = go.Figure()
-                
-                # Logic: We want to compare across years based on the current View Mode.
                 current_anchor = st.session_state.anchor_date
                 
                 if not selected_years_comp:
                     st.warning("Selecciona almenys un any per comparar.")
                 else:
                     for item in selection_series:
-                        # 1. Get Series Data (Full History)
                         if item == "TOTAL":
-                            s_full, _ = get_aggregated_data(df, all_cups)
+                            s_full, _ = get_aggregated_data_comp(df_data, cups_list)
                         elif item == "ENLLUMENAT (Agregat)":
-                            s_full, _ = get_aggregated_data(df, lighting_cups)
+                            s_full, _ = get_aggregated_data_comp(df_data, lighting_c)
                         elif item == "EDIFICIS (Agregat)":
-                            s_full, _ = get_aggregated_data(df, building_cups)
+                            s_full, _ = get_aggregated_data_comp(df_data, building_c)
                         else:
-                            if item in all_cups:
-                                cols = df[item].columns
+                            if item in cups_list and item in df_data.columns.get_level_values(0):
+                                cols = df_data[item].columns
                                 ae_col = [c for c in cols if 'AE' in c and 'kWh' in c and 'AUTOCONS' not in c]
                                 if ae_col:
-                                    s_full = df[item][ae_col[0]]
+                                    s_full = df_data[item][ae_col[0]]
                                 else:
                                     continue
+                            else: continue
                         
-                        # 2. Slice and Plot based on Mode
                         if mode_t2 == 'Anual':
-                            # Resample to Monthly first
                             s_monthly = s_full.resample('ME').sum()
-                            
                             month_map = {1: 'Gen', 2: 'Feb', 3: 'Mar', 4: 'Abr', 5: 'Mai', 6: 'Jun', 
                                          7: 'Jul', 8: 'Ago', 9: 'Set', 10: 'Oct', 11: 'Nov', 12: 'Des'}
-                            
                             for y in selected_years_comp:
                                 s_year = s_monthly[s_monthly.index.year == y]
                                 if not s_year.empty:
-                                    # Use Month Numbers (1-12) for X to ensure correct sorting/stacking
                                     x_vals = s_year.index.month
                                     fig_comp.add_trace(go.Scatter(
                                         x=x_vals, y=s_year, name=f"{item} ({y})", mode='lines+markers',
                                         hovertemplate="%{y:.2f} kWh<extra></extra>"
                                     ))
-                            
-                            # Force X-Axis to show all 12 months with names
                             xaxis_args_comp = {
-                                'title': "Mes", 
-                                'tickmode': 'array',
-                                'tickvals': list(range(1, 13)),
-                                'ticktext': list(month_map.values())
+                                'title': "Mes", 'tickmode': 'array',
+                                'tickvals': list(range(1, 13)), 'ticktext': list(month_map.values())
                             }
 
                         elif mode_t2 == 'Mensual':
                             target_month = current_anchor.month
                             target_month_name = current_anchor.strftime("%B")
                             s_daily = s_full.resample('1d').sum()
-                            
                             for y in selected_years_comp:
                                 mask = (s_daily.index.year == y) & (s_daily.index.month == target_month)
                                 s_sub = s_daily[mask]
                                 if not s_sub.empty:
                                     x_vals = s_sub.index.day
-                                    fig_comp.add_trace(go.Scatter(
-                                        x=x_vals, y=s_sub, name=f"{item} ({y})", mode='lines+markers'
-                                    ))
+                                    fig_comp.add_trace(go.Scatter(x=x_vals, y=s_sub, name=f"{item} ({y})", mode='lines+markers'))
                             xaxis_args_comp = {'title': f"Dia ({target_month_name})", 'dtick': 1}
 
                         elif mode_t2 == 'Setmanal':
                             target_week = current_anchor.isocalendar().week
                             s_daily = s_full.resample('1d').sum()
-                            
                             for y in selected_years_comp:
                                 mask = (s_daily.index.isocalendar().week == target_week) & (s_daily.index.year == y)
                                 s_sub = s_daily[mask]
                                 if not s_sub.empty:
                                     x_vals = s_sub.index.strftime('%a')
-                                    fig_comp.add_trace(go.Scatter(
-                                        x=x_vals, y=s_sub, name=f"{item} ({y})", mode='lines+markers'
-                                    ))
+                                    fig_comp.add_trace(go.Scatter(x=x_vals, y=s_sub, name=f"{item} ({y})", mode='lines+markers'))
                             xaxis_args_comp = {'title': f"Dia de la Setmana {target_week}", 'dtick': "M1"}
 
                         elif mode_t2 == 'Diària':
                             target_day = current_anchor.day
                             target_month = current_anchor.month
                             s_hourly = s_full
-                            
                             for y in selected_years_comp:
                                 mask = (s_hourly.index.year == y) & (s_hourly.index.month == target_month) & (s_hourly.index.day == target_day)
                                 s_sub = s_hourly[mask]
                                 if not s_sub.empty:
                                     x_vals = s_sub.index.hour
-                                    fig_comp.add_trace(go.Scatter(
-                                        x=x_vals, y=s_sub, name=f"{item} ({y})", mode='lines+markers'
-                                    ))
+                                    fig_comp.add_trace(go.Scatter(x=x_vals, y=s_sub, name=f"{item} ({y})", mode='lines+markers'))
                             xaxis_args_comp = {'title': f"Hora ({target_day}/{target_month})", 'tickmode': 'linear', 'dtick': 1}
 
                     fig_comp.update_layout(title="Evolució Comparativa (Multianual)", xaxis=xaxis_args_comp, hovermode="x unified")
                     st.plotly_chart(fig_comp, use_container_width=True)
 
-                    # SUMMARY TABLE (Tab 2)
+                    # SUMMARY TABLE
                     st.subheader("Resum Series Seleccionades (Període/Anys)")
                     if selected_years_comp:
-                        # Matrix Structure: Rows=Series, Cols=Years
                         data_matrix = []
-                        
                         for it in selection_series:
                             row_dict = {"Sèrie": it}
-                            
-                            # Get Data
-                            if it == "TOTAL": s_f, _ = get_aggregated_data(df, all_cups)
-                            elif it == "ENLLUMENAT (Agregat)": s_f, _ = get_aggregated_data(df, lighting_cups)
-                            elif it == "EDIFICIS (Agregat)": s_f, _ = get_aggregated_data(df, building_cups)
+                            if it == "TOTAL": s_f, _ = get_aggregated_data_comp(df_data, cups_list)
+                            elif it == "ENLLUMENAT (Agregat)": s_f, _ = get_aggregated_data_comp(df_data, lighting_c)
+                            elif it == "EDIFICIS (Agregat)": s_f, _ = get_aggregated_data_comp(df_data, building_c)
                             else:
-                                 cols = df[it].columns
-                                 ae_c = [c for c in cols if 'AE' in c and 'kWh' in c and 'AUTOCONS' not in c]
-                                 if ae_c: s_f = df[it][ae_c[0]]
+                                 if it in df_data.columns.get_level_values(0):
+                                     cols = df_data[it].columns
+                                     ae_c = [c for c in cols if 'AE' in c and 'kWh' in c and 'AUTOCONS' not in c]
+                                     if ae_c: s_f = df_data[it][ae_c[0]]
+                                     else: continue
                                  else: continue
                             
-                            # Calculate Per Year
                             total_row = 0
                             for y in selected_years_comp:
                                 mask_y = s_f.index.year == y
@@ -614,45 +571,32 @@ def main():
                                 row_dict[str(y)] = f"{val_y:.2f}"
                                 total_row += val_y
                             
-                            # row_dict["Total Període"] = f"{total_row:.2f}" # Optional, if they said "no sum" maybe they don't want total? Let's keep specific years.
                             data_matrix.append(row_dict)
                         
                         st.dataframe(pd.DataFrame(data_matrix))
                         
-                        # Bar Chart Visualization of the Summary
+                        # Bar Chart Visualization
                         st.caption("Visualització Gràfica del Resum Anual")
                         fig_summ_bar = go.Figure()
-                        
-                        # We want Grouped Bar Chart: X=Series, Group=Year
-                        # Iterate Years to create Traces
                         for y in selected_years_comp:
                             y_values = []
                             for row in data_matrix:
-                                # row has "Sèrie", "2023", "2024"...
                                 val_str = row.get(str(y), "0")
-                                val = float(val_str)
-                                y_values.append(val)
-                            
-                            x_names = [row["Sèrie"] for row in data_matrix]
+                                y_values.append(float(val_str))
                             
                             fig_summ_bar.add_trace(go.Bar(
-                                x=x_names,
-                                y=y_values,
                                 name=str(y),
-                                text=[f"{v:.0f}" for v in y_values],
-                                textposition='auto'
+                                x=[r["Sèrie"] for r in data_matrix],
+                                y=y_values
                             ))
-                        
-                        fig_summ_bar.update_layout(
-                            barmode='group',
-                            title="Comparativa de Totals per Sèrie i Any",
-                            yaxis_title="kWh",
-                            xaxis_title="Sèries",
-                            legend_title="Any"
-                        )
+                            
+                        fig_summ_bar.update_layout(barmode='group', template="plotly_white", margin=dict(t=10, b=10))
                         st.plotly_chart(fig_summ_bar, use_container_width=True)
-            else:
-                st.info("Selecciona almenys una sèrie per visualitzar.")
+
+        # === TAB 2: Comparative Analysis ===
+        with tab2:
+            st.header("Anàlisi Comparatiu")
+            render_tab_comparative(df, all_cups, lighting_cups, building_cups)
 
         # --- Tab 3: Public Lighting Auditor ---
         with tab3:

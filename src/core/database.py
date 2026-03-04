@@ -54,8 +54,9 @@ def load_fv_sala_nova_data():
     
     return df
 
+@st.cache_data(ttl=3600, show_spinner="Carregant dades generals de consum...")
 def load_from_supabase_db(start_date=None, end_date=None):
-    """Fetch readings from 'energy_readings_wide' (JSONB optimized format)."""
+    """Fetch readings from 'energy_readings_wide' (JSONB optimized format). Cached for performance."""
     supabase = init_supabase()
     if not supabase: return None
     
