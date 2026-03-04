@@ -324,35 +324,7 @@ def main():
             st.header("Visió General")
             render_tab_global(df, all_cups)
 
-        # === TAB 2: Comparative Analysis ===
-        with tab2:
-            st.header("Anàlisi Comparatiu")
-            
-            # 1. Quick Selectors
-            col_btn1, col_btn2, col_btn3, col_btn4 = st.columns(4)
-            
-            # Helper to update the multiselect state
-            def update_selection(new_list):
-                st.session_state["multi_comp"] = new_list
-            
-            if col_btn1.button("Tots (All)", key="btn_all"): 
-                update_selection(all_cups)
-            if col_btn2.button("Enllumenat", key="btn_light"): 
-                update_selection(lighting_cups)
-            if col_btn3.button("Edificis (Resta)", key="btn_build"): 
-                update_selection(building_cups)
-            if col_btn4.button("Netejar", key="btn_clear"): 
-                update_selection([])
-            
-            # Ensure the key exists before multiselect if not already (safeguard)
-            if "multi_comp" not in st.session_state:
-                 st.session_state["multi_comp"] = all_cups
-            
-            # Multiselect sync with buttons
-            current_selection = st.multiselect("CUPS Seleccionats", all_cups, key="multi_comp")
-            
-            # 2. Controls (Time) - Independent from Tab 1? 
-            # It's better to share Anchor Date usually, but maybe distinctive Modes.
+
         @st.fragment
         def render_tab_comparative(df_data, cups_list, lighting_c, building_c):
             # 1. Quick Selectors
@@ -1132,8 +1104,8 @@ def main():
                 
                 # --- Visualizations ---
                 # Prepare time series
-                ts_grid = pd.Series(0.0, index=df_filtered_t1.index)
-                ts_self = pd.Series(0.0, index=df_filtered_t1.index)
+                ts_grid = pd.Series(0.0, index=solar_df.index)
+                ts_self = pd.Series(0.0, index=solar_df.index)
                 
                 for c in self_consumption_cups:
                      cols = solar_df[c].columns 
