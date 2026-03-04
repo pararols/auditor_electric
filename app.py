@@ -359,21 +359,21 @@ def main():
             col_btn1, col_btn2, col_btn3, col_btn4 = st.columns(4)
             
             def update_selection(new_list):
-                st.session_state["multi_comp"] = new_list
+                st.session_state["t2_multi_comp"] = new_list
             
-            if col_btn1.button("Tots (All)", key="btn_all"): 
+            if col_btn1.button("Tots (All)", key="t2_btn_all"): 
                 update_selection(cups_list)
-            if col_btn2.button("Enllumenat", key="btn_light"): 
+            if col_btn2.button("Enllumenat", key="t2_btn_light"): 
                 update_selection(lighting_c)
-            if col_btn3.button("Edificis (Resta)", key="btn_build"): 
+            if col_btn3.button("Edificis (Resta)", key="t2_btn_build"): 
                 update_selection(building_c)
-            if col_btn4.button("Netejar", key="btn_clear"): 
+            if col_btn4.button("Netejar", key="t2_btn_clear"): 
                 update_selection([])
             
-            if "multi_comp" not in st.session_state:
-                 st.session_state["multi_comp"] = cups_list
+            if "t2_multi_comp" not in st.session_state:
+                 st.session_state["t2_multi_comp"] = cups_list
             
-            current_selection = st.multiselect("CUPS Seleccionats", cups_list, key="multi_comp")
+            current_selection = st.multiselect("CUPS Seleccionats", cups_list, key="t2_multi_comp")
             
             st.markdown("---")
             col_c1, col_c2, col_c3 = st.columns([2, 1, 3])
@@ -1428,5 +1428,7 @@ def main():
             except Exception as e:
                 st.error(f"Error carregant dades FV: {e}")
 
-if __name__ == "__main__":
+
+
+if __name__ == '__main__':
     main()
