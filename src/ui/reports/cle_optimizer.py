@@ -5,7 +5,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from scipy.optimize import minimize
 from pathlib import Path
-from src.core.config import COMMUNITY_QUOTAS, MUNICIPAL_CUPS_WHITELIST, CUPS_MAPPING
+from src.core.config import COMMUNITY_QUOTAS, COMMUNITY_PARTICIPANTS, CUPS_MAPPING
 from src.core.database import load_from_supabase_db
 
 # Paràmetres globals Subapp
@@ -43,7 +43,7 @@ def fetch_and_prep_consumption(year=2025):
     df = df[df['fecha_hora'].dt.year == year]
     
     # Quedar-nos només amb els CUPS municipals
-    df = df[df['cups'].isin(MUNICIPAL_CUPS_WHITELIST)]
+    df = df[df['cups'].isin(COMMUNITY_PARTICIPANTS)]
     
     if df.empty:
         return None
