@@ -27,6 +27,17 @@ CUPS_MAPPING = {
     "ES0031408457126001XL0F": "Pavelló",
     "ES0031408528667001SW0F": "Enll C/ nou",
     "ES0031408691405001KF0F": "Can Burcet",
+    # Participants Privats CLE Sala Nova (Anonimitzats)
+    "ES0031406231815001DS0F": "Part. Privat 01",
+    "ES0031408273101001WC0F": "Part. Privat 02",
+    "ES0031406053483001CX0F": "Part. Privat 03",
+    "ES0031408467847001TY0F": "Part. Privat 04",
+    "ES0031406053551001DE0F": "Part. Privat 05",
+    "ES003140863192001MC0F": "Part. Privat 06",
+    "ES0031406053458001ZB0F": "Part. Privat 07",
+    "ES0031406054122001LR0F": "Part. Privat 08",
+    "ES0031406053565001CS0F": "Part. Privat 09",
+    "ES0031406053376001ZY0F": "Part. Privat 10"
 }
 
 # --- Community Participants Whitelist ---
@@ -38,6 +49,29 @@ COMMUNITY_PARTICIPANTS = [
     "ES0031408332025001ZK0F", # Polivalent
     "ES0031408457126001XL0F"  # Pavelló
 ]
+
+# Repartiment oficial CLE Sala Nova (Potència kWp i Coeficient de Repartiment)
+# Inclou participants municipals i privats (Total 100%)
+COMMUNITY_QUOTAS = {
+    # Municipals
+    "ES0031406053357001QG0F": {"equipament": "Sala Nova", "kwp": 0.3160935, "coef": 0.018485},
+    "ES0031406053560001XY0F": {"equipament": "Escola", "kwp": 4.5844245, "coef": 0.268095},
+    "ES0031406054170001JT0F": {"equipament": "Ajuntament", "kwp": 3.8617785, "coef": 0.225835},
+    "ES0031408303814001QQ0F": {"equipament": "Llar d'Infants", "kwp": 1.1856114, "coef": 0.069334},
+    "ES0031408332025001ZK0F": {"equipament": "Sala Polivalent", "kwp": 0.4567752, "coef": 0.026712},
+    "ES0031408457126001XL0F": {"equipament": "Pavelló", "kwp": 1.6952769, "coef": 0.099139},
+    # Privats (Veïns - Anonimitzats)
+    "ES0031406231815001DS0F": {"equipament": "Part. Privat 01", "kwp": 0.500004, "coef": 0.029240},
+    "ES0031408273101001WC0F": {"equipament": "Part. Privat 02", "kwp": 0.500004, "coef": 0.029240},
+    "ES0031406053483001CX0F": {"equipament": "Part. Privat 03", "kwp": 0.500004, "coef": 0.029240},
+    "ES0031408467847001TY0F": {"equipament": "Part. Privat 04", "kwp": 0.500004, "coef": 0.029240},
+    "ES0031406053551001DE0F": {"equipament": "Part. Privat 05", "kwp": 0.500004, "coef": 0.029240},
+    "ES003140863192001MC0F": {"equipament": "Part. Privat 06", "kwp": 0.500004, "coef": 0.029240},
+    "ES0031406053458001ZB0F": {"equipament": "Part. Privat 07", "kwp": 0.500004, "coef": 0.029240},
+    "ES0031406054122001LR0F": {"equipament": "Part. Privat 08", "kwp": 0.500004, "coef": 0.029240},
+    "ES0031406053565001CS0F": {"equipament": "Part. Privat 09", "kwp": 0.500004, "coef": 0.029240},
+    "ES0031406053376001ZY0F": {"equipament": "Part. Privat 10", "kwp": 0.500004, "coef": 0.029240}
+}
 
 # --- Localization ---
 month_names = {

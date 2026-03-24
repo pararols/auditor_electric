@@ -14,6 +14,7 @@ from src.core.config import CUPS_MAPPING, COMMUNITY_PARTICIPANTS, month_names, m
 from src.core.database import init_supabase, load_fv_sala_nova_data, load_from_supabase_db, sync_csv_to_db
 from src.ui.layout import render_login, render_sidebar, init_session_state
 from src.ui.views.executive import render_executive_report
+from src.ui.reports.cle_optimizer import render_cle_optimizer
 from src.utils.parsers import parse_processed_csv, process_edistribucion_files
 from src.utils.data_utils import classify_cups_by_name, detect_self_consumption_cups, get_date_range, shift_date
 
@@ -224,7 +225,7 @@ def main():
              st.session_state.selected_cups_list = all_cups
 
         # --- Tabs ---
-        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📊 Panell Global", "📈 Comparativa", "🌃 Auditor Enllumenat", "🤖 AI Advisor", "☀️ Autoconsum", "☀️ FV Sala Nova"])
+        tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["📊 Panell Global", "📈 Comparativa", "🌃 Auditor Enllumenat", "🤖 AI Advisor", "☀️ Autoconsum", "☀️ FV Sala Nova", "⚙️ Optimitzador CLE"])
         
         @st.fragment
         def render_tab_global(df_data, cups_list):
@@ -1400,6 +1401,9 @@ def main():
             except Exception as e:
                 st.error(f"Error carregant dades FV: {e}")
 
+        # === TAB 7: Optimitzador CLE ===
+        with tab7:
+            render_cle_optimizer()
 
 
 if __name__ == '__main__':
