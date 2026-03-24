@@ -5,3 +5,4 @@ astral
 openpyxl
 supabase
 requests
+scipy
