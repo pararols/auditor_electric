@@ -15,7 +15,9 @@ TARGET_RATIO = TARGET_KWP / PAVELLO_KWP
 
 def load_solar_curves():
     """Carrega les corbes de generació anual del Pavelló (127.2 kWp) i Sala Nova (17.1 kWp)."""
-    base_path = Path("c:/Users/parar/OneDrive/Documents/antigravity/auditor electric")
+    # Usar camí relatiu a l'arrel del projecte (on estan els CSVs)
+    # cle_optimizer.py està a src/ui/reports/, l'arrel és 3 nivells amunt
+    base_path = Path(__file__).parents[3]
     
     # Pavello
     df_pav = pd.read_csv(base_path / "modelpavello.csv", sep=";", decimal=",")
@@ -35,31 +37,56 @@ def load_solar_curves():
 def fetch_and_prep_consumption(year=2025):
     """Carrega el consum horari de l'any objectiu per als CUPS municipals."""
     df_raw = load_from_supabase_db()
-    if df_raw.empty:
+    if df_raw is None or df_raw.empty:
         return None
         
     df = df_raw.copy()
-    # Filtrar per l'any indicat
-    df = df[df['fecha_hora'].dt.year == year]
     
-    # Quedar-nos només amb els CUPS municipals
-    df = df[df['cups'].isin(COMMUNITY_PARTICIPANTS)]
+    # Filtrar per l'any indicat usant l'índex que és Datetime
+    df = df[df.index.year == year]
     
     if df.empty:
         return None
         
-    # Pivotar per tenir files = hores, columnes = cups
-    df_pivot = df.pivot_table(index='fecha_hora', columns='cups', values='consumo_kwh', aggfunc='sum').fillna(0)
+    # Reconstruir el consum total (Xarxa + Autoconsum existent de Sala Nova)
+    # per cada CUPS participant.
+    cups_data = {}
     
-    # Comprovar si tenim l'any complert o no. Si no el tenim complert, necessitem un index de 8760 hores complert 
-    # per quadrar amb la corba de generació de referència.
+    for cups in COMMUNITY_PARTICIPANTS:
+        if cups not in df.columns.get_level_values(0):
+            continue
+            
+        # Obtenir columnes d'aquest CUPS
+        cols = df[cups].columns
+        
+        # Consum de xarxa (Importació)
+        ae_col = [c for c in cols if 'AE' in c and 'kWh' in c and 'AUTOCONS' not in c]
+        # Autoconsum instantani (si existeix a la DB per aquest CUPS)
+        auto_col = [c for c in cols if 'AUTOCONS' in c]
+        
+        val_total = pd.Series(0.0, index=df.index)
+        if ae_col:
+            val_total = val_total.add(df[cups][ae_col[0]], fill_value=0)
+        if auto_col:
+            val_total = val_total.add(df[cups][auto_col[0]], fill_value=0)
+            
+        cups_data[cups] = val_total
+        
+    if not cups_data:
+        return None
+        
+    df_final = pd.DataFrame(cups_data)
+    
+    # Garantir index de 8760 hores
     full_index = pd.date_range(start=f"{year}-01-01 00:00:00", end=f"{year}-12-31 23:00:00", freq='h')
     
-    # Handle duplicate hours (like Daylight Savings Time changes)
-    df_pivot = df_pivot.groupby(df_pivot.index).mean()
+    # Treure duplicats si n'hi hagués
+    df_final = df_final.groupby(df_final.index).mean()
     
-    df_pivot = df_pivot.reindex(full_index, fill_value=0)
-    return df_pivot
+    # Reindexar per tenir l'any complert per a la simulació
+    df_final = df_final.reindex(full_index, fill_value=0)
+    
+    return df_final
 
 def calculate_tariffs(full_index, p1=0.22, p2=0.147, p3=0.11):
     """Construeix el vector de tarifes P1/P2/P3 segons calendari peninsular."""
