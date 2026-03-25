@@ -154,6 +154,9 @@ def evaluate_coefficients(coefs, cups_names, df_consum, gen_pavello, gen_salanov
         cost_nosolar_cups = 0
         cost_solar_cups = 0
         
+        estalvi_auto_cups = 0
+        estalvi_comp_cups = 0
+        
         excedents_compensats_qty = 0
         excedents_abocats_qty = 0
         
@@ -178,6 +181,13 @@ def evaluate_coefficients(coefs, cups_names, df_consum, gen_pavello, gen_salanov
             # Impostos aplicats SOBRE EL TERME NET
             c_sol_taxes = (terme_energia_net * 1.0511) * 1.21
             cost_solar_cups += c_sol_taxes
+            
+            # Desglossament d'estalvis
+            estalvi_auto_month = (c_nos - c_sol_import) * 1.0511 * 1.21
+            estalvi_comp_month = (c_sol_import - terme_energia_net) * 1.0511 * 1.21
+            
+            estalvi_auto_cups += estalvi_auto_month
+            estalvi_comp_cups += estalvi_comp_month
             
             # Tracking físic
             if v_excedents <= c_sol_import:
@@ -222,13 +232,16 @@ def evaluate_coefficients(coefs, cups_names, df_consum, gen_pavello, gen_salanov
             'Nom': CUPS_MAPPING.get(cups, "Desconegut"),
             'Coeficient Pavelló': coef_pav,
             'Consum Anual (kWh)': np.sum(consum),
+            'Producció FV (kWh)': np.sum(gen_total),
             'Autoconsum SN (kWh)': total_auto_sn,
             'Autoconsum PAV (kWh)': total_auto_pav,
             'Autoconsum Total (kWh)': np.sum(autoconsum),
+            'Cobertura (%)': (np.sum(autoconsum) / np.sum(consum)) * 100 if np.sum(consum)>0 else 0,
             'Excedents Compensats (kWh)': excedents_compensats_qty,
             'Excedents Llençats a la xarxa (kWh)': excedents_abocats_qty,
+            'Estalvi Autoconsum (€)': estalvi_auto_cups,
+            'Estalvi Compensació (€)': estalvi_comp_cups,
             'Estalvi Anual (€)': cost_nosolar_cups - cost_solar_cups,
-            'Cobertura (%)': (np.sum(autoconsum) / np.sum(consum)) * 100 if np.sum(consum)>0 else 0,
             'Mensual': mensual_stats
         })
         
@@ -369,9 +382,13 @@ def render_cle_optimizer():
         df_display = df_res.copy()
         df_display['Coeficient Pavelló'] = df_display['Coeficient Pavelló'].apply(lambda x: f"{x:.6f}")
         df_display['Consum Anual (kWh)'] = df_display['Consum Anual (kWh)'].apply(lambda x: f"{x:,.0f} kWh".replace(',','.'))
-        df_display['Estalvi Anual (€)'] = df_display['Estalvi Anual (€)'].apply(lambda x: f"{x:,.2f} €".replace(',','.'))
-        df_display['Cobertura (%)'] = df_display['Cobertura (%)'].apply(lambda x: f"{x:.1f} %")
+        df_display['Producció FV'] = df_display['Producció FV (kWh)'].apply(lambda x: f"{x:,.0f} kWh".replace(',','.'))
         
+        df_display['Estalvi Autoconsum (€)'] = df_display['Estalvi Autoconsum (€)'].apply(lambda x: f"{x:,.2f} €".replace(',','.'))
+        df_display['Estalvi Compensació (€)'] = df_display['Estalvi Compensació (€)'].apply(lambda x: f"{x:,.2f} €".replace(',','.'))
+        df_display['Estalvi Anual (€)'] = df_display['Estalvi Anual (€)'].apply(lambda x: f"{x:,.2f} €".replace(',','.'))
+        
+        df_display['Cobertura (%)'] = df_display['Cobertura (%)'].apply(lambda x: f"{x:.1f} %")
         df_display['Autoconsum (Sala Nova)'] = df_display['Autoconsum SN (kWh)'].apply(lambda x: f"{x:,.0f} kWh".replace(',','.'))
         df_display['Autoconsum (Pavelló)'] = df_display['Autoconsum PAV (kWh)'].apply(lambda x: f"{x:,.0f} kWh".replace(',','.'))
         
@@ -379,10 +396,15 @@ def render_cle_optimizer():
         df_display['Excedents Llençats'] = df_display['Excedents Llençats a la xarxa (kWh)'].apply(lambda x: f"{x:,.0f} kWh".replace(',','.'))
         df_display['Autoconsum Total'] = df_display['Autoconsum Total (kWh)'].apply(lambda x: f"{x:,.0f} kWh".replace(',','.'))
         
-        df_display = df_display.drop(columns=[
-            'Autoconsum SN (kWh)', 'Autoconsum PAV (kWh)', 
-            'Excedents Llençats a la xarxa (kWh)', 'Excedents Compensats (kWh)', 'Autoconsum Total (kWh)'
-        ])
+        # Defineix l'ordre final
+        cols_order = [
+            'CUPS', 'Nom', 'Coeficient Pavelló', 
+            'Consum Anual (kWh)', 'Producció FV',
+            'Autoconsum (Sala Nova)', 'Autoconsum (Pavelló)', 'Autoconsum Total', 'Cobertura (%)',
+            'Excedents Compensats', 'Excedents Llençats',
+            'Estalvi Autoconsum (€)', 'Estalvi Compensació (€)', 'Estalvi Anual (€)'
+        ]
+        df_display = df_display[cols_order]
         
         st.dataframe(df_display, use_container_width=True)
         
