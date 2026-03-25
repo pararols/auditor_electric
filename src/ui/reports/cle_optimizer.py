@@ -256,6 +256,31 @@ def run_optimization(df_consum, prices, excedent_price):
     # Restricció: suma de coeficients = TARGET_RATIO
     constraints = {'type': 'eq', 'fun': lambda c: np.sum(c) - TARGET_RATIO}
     
+    # --- Interfície de Temps Real ---
+    st.markdown("#### 🔄 Progrés de l'Optimització (Temps Real)")
+    col_it, col_sav, col_aut, col_exc = st.columns(4)
+    pl_it = col_it.empty()
+    pl_sav = col_sav.empty()
+    pl_aut = col_aut.empty()
+    pl_exc = col_exc.empty()
+    
+    iteration_count = [0]
+    
+    def optimizer_callback(xk):
+        iteration_count[0] += 1
+        # Avaluar l'estat actual dels coeficients
+        sav_neg, details = evaluate_coefficients(xk, cups_names, df_consum, gen_pavello, gen_salanova, prices, excedent_price)
+        
+        t_sav = -sav_neg
+        t_aut = sum(d['Autoconsum Total (kWh)'] for d in details)
+        t_exc = sum(d['Excedents Llençats a la xarxa (kWh)'] for d in details)
+        
+        # Actualitzar UI
+        pl_it.metric("Iteració", f"#{iteration_count[0]}")
+        pl_sav.metric("Estalvi Anual", f"{t_sav:,.0f} €".replace(',', '.'))
+        pl_aut.metric("Autoconsum", f"{t_aut:,.0f} kWh".replace(',', '.'))
+        pl_exc.metric("Excedent No Compensat", f"{t_exc:,.0f} kWh".replace(',', '.'))
+
     with st.spinner("L'algoritme d'optimització iteratiu està determinant el repartiment màxim... (això pot trigar uns segons)"):
         opt_res = minimize(
             objective_function, 
@@ -264,6 +289,7 @@ def run_optimization(df_consum, prices, excedent_price):
             method='SLSQP',
             bounds=bounds,
             constraints=constraints,
+            callback=optimizer_callback,
             options={'disp': False, 'ftol': 1e-4}
         )
         
@@ -272,6 +298,7 @@ def run_optimization(df_consum, prices, excedent_price):
         opt_res.x, cups_names, df_consum, gen_pavello, gen_salanova, prices, excedent_price
     )
     return detailed_results
+
     
 @st.fragment
 def render_cle_optimizer():
