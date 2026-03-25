@@ -376,6 +376,14 @@ def render_cle_optimizer():
         * Totes les xifres econòmiques estan finalment gravades amb Impost Elèctric (5.11%) i IVA (21%).
     """)
     
+    st.markdown("#### Paràmetres d'Anàlisi i Opcions Legals")
+    
+    # Nova sub-opció ben visible a dalt (Poda de <0.5 kWp)
+    filter_micro = st.checkbox("Excloure assignacions minúscules (< 0.5 kWp de potència equivalent) per simplificar càrrega administrativa municipal", value=True)
+    min_kwp_val = 0.5 if filter_micro else 0.0
+    
+    st.write("") # Separador
+    
     # UI Constants
     col1, col2, col3, col4, col5 = st.columns(5)
     p1 = col1.number_input("Preu P1 (€/kWh)", value=0.22, format="%.3f")
@@ -387,10 +395,7 @@ def render_cle_optimizer():
     _, av_years = fetch_and_prep_consumption(2025)
     selected_year = col5.selectbox("Any d'Anàlisi", av_years if av_years else [2025], index=av_years.index(2025) if 2025 in av_years else 0)
     
-    # Opcions avançades
-    st.markdown("#### Exigències Tècniques i Legals")
-    filter_micro = st.checkbox("Excloure coeficients minúsculs (< 0.5 kWp assignats) per simplificar burocràcia i facturació", value=True)
-    min_kwp_val = 0.5 if filter_micro else 0.0
+    st.write("") # Separador
     
     if st.button("Executar Motor d'Optimització", type="primary"):
         df_consum, years_found = fetch_and_prep_consumption(selected_year)
