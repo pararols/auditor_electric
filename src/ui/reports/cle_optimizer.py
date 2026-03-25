@@ -309,9 +309,25 @@ def run_optimization(df_consum, prices, excedent_price):
             options={'disp': False, 'ftol': 1e-4}
         )
         
+    # --- Ajust d'Arrodoniment a 6 Decimals (Legalitat RD 244/2019) ---
+    raw_coefs = opt_res.x
+    target_int = int(round(TARGET_RATIO * 1e6))
+    
+    coefs_int = np.int64(np.floor(raw_coefs * 1e6))
+    remainders = (raw_coefs * 1e6) - coefs_int
+    
+    diff = target_int - np.sum(coefs_int)
+    if diff > 0:
+        # Repartir el diff restant als que tenen el remainder més gran
+        indices = np.argsort(remainders)[-diff:]
+        for idx in indices:
+            coefs_int[idx] += 1
+            
+    final_coefs = coefs_int / 1e6
+        
     # Extraure resultats finals
     _, detailed_results = evaluate_coefficients(
-        opt_res.x, cups_names, df_consum, gen_pavello, gen_salanova, prices, excedent_price
+        final_coefs, cups_names, df_consum, gen_pavello, gen_salanova, prices, excedent_price
     )
     return detailed_results
 
