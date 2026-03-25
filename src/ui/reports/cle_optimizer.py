@@ -38,15 +38,16 @@ def fetch_and_prep_consumption(year=2025):
     """Carrega el consum horari de l'any objectiu per als CUPS municipals."""
     df_raw = load_from_supabase_db()
     if df_raw is None or df_raw.empty:
-        return None
+        return None, []
         
     df = df_raw.copy()
+    available_years = sorted(df.index.year.unique().tolist())
     
     # Filtrar per l'any indicat usant l'índex que és Datetime
     df = df[df.index.year == year]
     
     if df.empty:
-        return None
+        return None, available_years
         
     # Reconstruir el consum total (Xarxa + Autoconsum existent de Sala Nova)
     # per cada CUPS participant.
@@ -73,7 +74,7 @@ def fetch_and_prep_consumption(year=2025):
         cups_data[cups] = val_total
         
     if not cups_data:
-        return None
+        return None, available_years
         
     df_final = pd.DataFrame(cups_data)
     
@@ -86,7 +87,7 @@ def fetch_and_prep_consumption(year=2025):
     # Reindexar per tenir l'any complert per a la simulació
     df_final = df_final.reindex(full_index, fill_value=0)
     
-    return df_final
+    return df_final, available_years
 
 def calculate_tariffs(full_index, p1=0.22, p2=0.147, p3=0.11):
     """Construeix el vector de tarifes P1/P2/P3 segons calendari peninsular."""
@@ -263,16 +264,24 @@ def render_cle_optimizer():
     """)
     
     # UI Constants
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     p1 = col1.number_input("Preu P1 (€/kWh)", value=0.22, format="%.3f")
     p2 = col2.number_input("Preu P2 (€/kWh)", value=0.147, format="%.3f")
     p3 = col3.number_input("Preu P3 (€/kWh)", value=0.11, format="%.3f")
     p_exc = col4.number_input("Compensació Excedents (€)", value=0.07, format="%.3f")
     
+    # Fem consulta ràpida per saber quins anys hi ha
+    _, av_years = fetch_and_prep_consumption(2025)
+    selected_year = col5.selectbox("Any d'Anàlisi", av_years if av_years else [2025], index=av_years.index(2025) if 2025 in av_years else 0)
+    
     if st.button("Executar Motor d'Optimització", type="primary"):
-        df_consum = fetch_and_prep_consumption(2025)
+        df_consum, years_found = fetch_and_prep_consumption(selected_year)
         if df_consum is None or df_consum.empty:
-            st.error("No s'han trobat dades de consum suficients per als CUPS municipals per l'any 2025.")
+            st.error(f"No s'han trobat dades de consum suficients per als CUPS municipals per l'any {selected_year}.")
+            if years_found:
+                 st.info(f"Anys disponibles a la base de dades: {', '.join(map(str, years_found))}")
+            else:
+                 st.warning("La base de dades sembla estar buida o no s'ha pogut carregar.")
             return
             
         prices = calculate_tariffs(df_consum.index, p1, p2, p3)
