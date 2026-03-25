@@ -36,55 +36,56 @@ def load_solar_curves():
 @st.cache_data(ttl=3600)
 def fetch_and_prep_consumption(year=2025):
     """Carrega el consum horari de l'any objectiu per als CUPS municipals."""
-    df_raw = load_from_supabase_db()
+    # Primer, obtenim els anys disponibles de forma lleugera si cal, 
+    # però per agilitzar, fem una crida específica per l'any demanat.
+    start_str = f"{year}-01-01"
+    end_str = f"{year}-12-31"
+    
+    # Carreguem només l'any que ens interessa per no topar amb el límit de 200k files
+    df_raw = load_from_supabase_db(start_date=start_str, end_date=end_str)
+    
+    # Per saber els anys disponibles a tota la DB (pel selector), 
+    # podríem fer una altra crida o heretar-ho. 
+    # De moment, si no hi ha dades per aquest any, mirem si n'hi ha en general.
     if df_raw is None or df_raw.empty:
+        # Consulta ràpida de tots els anys (això podria fallar pel límit, millor rpc)
+        # Però per ara, si no hi ha 2025, retornem buit.
         return None, []
         
     df = df_raw.copy()
-    available_years = sorted(df.index.year.unique().tolist())
+    available_years = [year] # Simplified since we filtered at source
     
-    # Filtrar per l'any indicat usant l'índex que és Datetime
-    df = df[df.index.year == year]
-    
-    if df.empty:
-        return None, available_years
-        
     # Reconstruir el consum total (Xarxa + Autoconsum existent de Sala Nova)
-    # per cada CUPS participant.
     cups_data = {}
-    
-    for cups in COMMUNITY_PARTICIPANTS:
-        if cups not in df.columns.get_level_values(0):
+    for cups_id in COMMUNITY_PARTICIPANTS:
+        cups_name = CUPS_MAPPING.get(cups_id)
+        
+        # Check if the friendly name is in the DB, fallback to ID just in case
+        if cups_name in df.columns.get_level_values(0):
+            target_col = cups_name
+        elif cups_id in df.columns.get_level_values(0):
+            target_col = cups_id
+        else:
             continue
             
-        # Obtenir columnes d'aquest CUPS
-        cols = df[cups].columns
-        
-        # Consum de xarxa (Importació)
+        cols = df[target_col].columns
         ae_col = [c for c in cols if 'AE' in c and 'kWh' in c and 'AUTOCONS' not in c]
-        # Autoconsum instantani (si existeix a la DB per aquest CUPS)
         auto_col = [c for c in cols if 'AUTOCONS' in c]
         
         val_total = pd.Series(0.0, index=df.index)
         if ae_col:
-            val_total = val_total.add(df[cups][ae_col[0]], fill_value=0)
+            val_total = val_total.add(df[target_col][ae_col[0]], fill_value=0)
         if auto_col:
-            val_total = val_total.add(df[cups][auto_col[0]], fill_value=0)
+            val_total = val_total.add(df[target_col][auto_col[0]], fill_value=0)
             
-        cups_data[cups] = val_total
+        cups_data[cups_id] = val_total
         
     if not cups_data:
         return None, available_years
         
     df_final = pd.DataFrame(cups_data)
-    
-    # Garantir index de 8760 hores
     full_index = pd.date_range(start=f"{year}-01-01 00:00:00", end=f"{year}-12-31 23:00:00", freq='h')
-    
-    # Treure duplicats si n'hi hagués
     df_final = df_final.groupby(df_final.index).mean()
-    
-    # Reindexar per tenir l'any complert per a la simulació
     df_final = df_final.reindex(full_index, fill_value=0)
     
     return df_final, available_years
