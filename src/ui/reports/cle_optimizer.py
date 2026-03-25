@@ -57,7 +57,8 @@ def fetch_and_prep_consumption(year=2025):
     
     # Reconstruir el consum total (Xarxa + Autoconsum existent de Sala Nova)
     cups_data = {}
-    for cups_id in COMMUNITY_PARTICIPANTS:
+    municipal_cups_ids = [k for k, v in CUPS_MAPPING.items() if not str(v).startswith("Part. Privat")]
+    for cups_id in municipal_cups_ids:
         cups_name = CUPS_MAPPING.get(cups_id)
         
         # Check if the friendly name is in the DB, fallback to ID just in case
@@ -141,7 +142,9 @@ def evaluate_coefficients(coefs, cups_names, df_consum, gen_pavello, gen_salanov
         coef_pav = coefs[i]
         
         # Generació assignada
-        gen_total = (gen_salanova * coef_sn) + (gen_pavello * coef_pav)
+        gen_sn = gen_salanova * coef_sn
+        gen_pav = gen_pavello * coef_pav
+        gen_total = gen_sn + gen_pav
         
         # Autoconsum i Excedents
         autoconsum = np.minimum(consum, gen_total)
@@ -188,20 +191,39 @@ def evaluate_coefficients(coefs, cups_names, df_consum, gen_pavello, gen_salanov
             excedents_compensats_qty += exc_comp
             excedents_abocats_qty += exc_lost
             
+            # Repartiment proporcional d'Autoconsum entre plantes
+            prop_sn = np.zeros_like(gen_total[mask])
+            prop_pav = np.zeros_like(gen_total[mask])
+            valid_gen = gen_total[mask] > 0
+            prop_sn[valid_gen] = gen_sn[mask][valid_gen] / gen_total[mask][valid_gen]
+            prop_pav[valid_gen] = gen_pav[mask][valid_gen] / gen_total[mask][valid_gen]
+            
+            auto_sn_mask = autoconsum[mask] * prop_sn
+            auto_pav_mask = autoconsum[mask] * prop_pav
+            
             mensual_stats.append({
                 'Mes': m,
                 'Consum': np.sum(consum[mask]),
                 'Generació Assignada': np.sum(gen_total[mask]),
+                'Generació Assignada SN': np.sum(gen_sn[mask]),
+                'Generació Assignada PAV': np.sum(gen_pav[mask]),
+                'Autoconsum SN': np.sum(auto_sn_mask),
+                'Autoconsum PAV': np.sum(auto_pav_mask),
                 'Autoconsum': np.sum(autoconsum[mask]),
                 'Import Net': np.sum(net_import[mask]),
                 'Estalvi € (Brut)': c_nos_taxes - c_sol_taxes
             })
             
+        total_auto_sn = sum([x['Autoconsum SN'] for x in mensual_stats])
+        total_auto_pav = sum([x['Autoconsum PAV'] for x in mensual_stats])
+        
         results_by_cups.append({
             'CUPS': cups,
             'Nom': CUPS_MAPPING.get(cups, "Desconegut"),
             'Coeficient Pavelló': coef_pav,
             'Consum Anual (kWh)': np.sum(consum),
+            'Autoconsum SN (kWh)': total_auto_sn,
+            'Autoconsum PAV (kWh)': total_auto_pav,
             'Autoconsum Total (kWh)': np.sum(autoconsum),
             'Excedents Compensats (kWh)': excedents_compensats_qty,
             'Excedents Llençats a la xarxa (kWh)': excedents_abocats_qty,
@@ -302,6 +324,10 @@ def render_cle_optimizer():
         df_res['Estalvi Anual (€)'] = df_res['Estalvi Anual (€)'].apply(lambda x: f"{x:,.2f} €".replace(',','.'))
         df_res['Cobertura (%)'] = df_res['Cobertura (%)'].apply(lambda x: f"{x:.1f} %")
         
+        df_res['Autoconsum (Sala Nova)'] = df_res['Autoconsum SN (kWh)'].apply(lambda x: f"{x:,.0f} kWh".replace(',','.'))
+        df_res['Autoconsum (Pavelló)'] = df_res['Autoconsum PAV (kWh)'].apply(lambda x: f"{x:,.0f} kWh".replace(',','.'))
+        df_res = df_res.drop(columns=['Autoconsum SN (kWh)', 'Autoconsum PAV (kWh)'])
+        
         st.dataframe(df_res, use_container_width=True)
         
         # --- DASHBOARD MENSUAL ---
@@ -311,8 +337,10 @@ def render_cle_optimizer():
         monthly_aggs = []
         for m in range(1, 13):
             m_consum = sum([list(filter(lambda x: x['Mes'] == m, r['Mensual']))[0]['Consum'] for r in detailed_results])
-            m_gen = sum([list(filter(lambda x: x['Mes'] == m, r['Mensual']))[0]['Generació Assignada'] for r in detailed_results])
-            m_auto = sum([list(filter(lambda x: x['Mes'] == m, r['Mensual']))[0]['Autoconsum'] for r in detailed_results])
+            m_gen_sn = sum([list(filter(lambda x: x['Mes'] == m, r['Mensual']))[0]['Generació Assignada SN'] for r in detailed_results])
+            m_gen_pav = sum([list(filter(lambda x: x['Mes'] == m, r['Mensual']))[0]['Generació Assignada PAV'] for r in detailed_results])
+            m_auto_sn = sum([list(filter(lambda x: x['Mes'] == m, r['Mensual']))[0]['Autoconsum SN'] for r in detailed_results])
+            m_auto_pav = sum([list(filter(lambda x: x['Mes'] == m, r['Mensual']))[0]['Autoconsum PAV'] for r in detailed_results])
             m_import = sum([list(filter(lambda x: x['Mes'] == m, r['Mensual']))[0]['Import Net'] for r in detailed_results])
             m_estalvi = sum([list(filter(lambda x: x['Mes'] == m, r['Mensual']))[0]['Estalvi € (Brut)'] for r in detailed_results])
             
@@ -320,7 +348,10 @@ def render_cle_optimizer():
                 'Mes': m,
                 'Consum Brut (kWh)': m_consum,
                 'Import Net Xarxa (kWh)': m_import,
-                'Autoconsum Total (kWh)': m_auto,
+                'Generació SN (kWh)': m_gen_sn,
+                'Generació PAV (kWh)': m_gen_pav,
+                'Autoconsum SN (kWh)': m_auto_sn,
+                'Autoconsum PAV (kWh)': m_auto_pav,
                 'Estalvi Efectiu Mensual (€)': m_estalvi
             })
             
@@ -330,13 +361,28 @@ def render_cle_optimizer():
         
         fig1 = go.Figure()
         fig1.add_trace(go.Bar(x=df_months['Mes'], y=df_months['Import Net Xarxa (kWh)'], name='Importació (Pagada)', marker_color='#a5d6a7'))
-        fig1.add_trace(go.Bar(x=df_months['Mes'], y=df_months['Autoconsum Total (kWh)'], name='Autoconsum (Estalviat)', marker_color='#2e7d32'))
+        fig1.add_trace(go.Bar(x=df_months['Mes'], y=df_months['Autoconsum SN (kWh)'], name='Autoconsum (Sala Nova)', marker_color='#fbc02d'))
+        fig1.add_trace(go.Bar(x=df_months['Mes'], y=df_months['Autoconsum PAV (kWh)'], name='Autoconsum (Pavelló)', marker_color='#2e7d32'))
         
         fig1.update_layout(barmode='stack', title='Estructura de l\'Energia Mensual per a l\'Administració',
                            xaxis_title='Mes', yaxis_title='kWh')
         st.plotly_chart(fig1, use_container_width=True)
         
+        fig3 = go.Figure()
+        
+        exc_sn = df_months['Generació SN (kWh)'] - df_months['Autoconsum SN (kWh)']
+        exc_pav = df_months['Generació PAV (kWh)'] - df_months['Autoconsum PAV (kWh)']
+        
+        fig3.add_trace(go.Bar(x=df_months['Mes'], y=df_months['Autoconsum SN (kWh)'] + df_months['Autoconsum PAV (kWh)'], name='Autoconsum Aprofitat', marker_color='#43a047'))
+        fig3.add_trace(go.Bar(x=df_months['Mes'], y=exc_sn, name='Excedents No Aprofitats (Sala Nova)', marker_color='#fff59d'))
+        fig3.add_trace(go.Bar(x=df_months['Mes'], y=exc_pav, name='Excedents No Aprofitats (Pavelló)', marker_color='#a5d6a7'))
+        
+        fig3.update_layout(barmode='stack', title='Destí de la Generació Solar: Aprofitament vs Excedents',
+                           xaxis_title='Mes', yaxis_title='kWh')
+        st.plotly_chart(fig3, use_container_width=True)
+        
         fig2 = px.line(df_months, x='Mes', y='Estalvi Efectiu Mensual (€)', markers=True, 
                        title='Corba Econòmica: Estalvi Efectiu (Taxes i Límits RD 244 Inclòs)')
         fig2.update_traces(line_color='#d32f2f', marker=dict(size=8))
         st.plotly_chart(fig2, use_container_width=True)
+
