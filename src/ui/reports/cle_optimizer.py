@@ -258,11 +258,12 @@ def run_optimization(df_consum, prices, excedent_price):
     
     # --- Interfície de Temps Real ---
     st.markdown("#### 🔄 Progrés de l'Optimització (Temps Real)")
-    col_it, col_sav, col_aut, col_exc = st.columns(4)
+    col_it, col_sav, col_aut, col_exc_comp, col_exc_lost = st.columns(5)
     pl_it = col_it.empty()
     pl_sav = col_sav.empty()
     pl_aut = col_aut.empty()
-    pl_exc = col_exc.empty()
+    pl_exc_comp = col_exc_comp.empty()
+    pl_exc_lost = col_exc_lost.empty()
     
     iteration_count = [0]
     
@@ -273,13 +274,15 @@ def run_optimization(df_consum, prices, excedent_price):
         
         t_sav = -sav_neg
         t_aut = sum(d['Autoconsum Total (kWh)'] for d in details)
-        t_exc = sum(d['Excedents Llençats a la xarxa (kWh)'] for d in details)
+        t_exc_comp = sum(d['Excedents Compensats (kWh)'] for d in details)
+        t_exc_lost = sum(d['Excedents Llençats a la xarxa (kWh)'] for d in details)
         
         # Actualitzar UI
         pl_it.metric("Iteració", f"#{iteration_count[0]}")
         pl_sav.metric("Estalvi Anual", f"{t_sav:,.0f} €".replace(',', '.'))
         pl_aut.metric("Autoconsum", f"{t_aut:,.0f} kWh".replace(',', '.'))
-        pl_exc.metric("Excedent No Compensat", f"{t_exc:,.0f} kWh".replace(',', '.'))
+        pl_exc_comp.metric("Excedent Compensat", f"{t_exc_comp:,.0f} kWh".replace(',', '.'))
+        pl_exc_lost.metric("Excedent No Compensat", f"{t_exc_lost:,.0f} kWh".replace(',', '.'))
 
     with st.spinner("L'algoritme d'optimització iteratiu està determinant el repartiment màxim... (això pot trigar uns segons)"):
         opt_res = minimize(
@@ -346,16 +349,42 @@ def render_cle_optimizer():
         df_res = pd.DataFrame(detailed_results)
         df_res = df_res.drop(columns=['Mensual'])
         
-        # Format coeficient a 6 decimals
-        df_res['Coeficient Pavelló'] = df_res['Coeficient Pavelló'].apply(lambda x: f"{x:.6f}")
-        df_res['Estalvi Anual (€)'] = df_res['Estalvi Anual (€)'].apply(lambda x: f"{x:,.2f} €".replace(',','.'))
-        df_res['Cobertura (%)'] = df_res['Cobertura (%)'].apply(lambda x: f"{x:.1f} %")
+        # Add Total Row
+        totals = df_res.sum(numeric_only=True)
+        totals['CUPS'] = 'TOTAL AGREGAT'
+        totals['Nom'] = ''
+        totals['Cobertura (%)'] = (totals['Autoconsum Total (kWh)'] / totals['Consum Anual (kWh)']) * 100 if totals['Consum Anual (kWh)'] else 0
+        df_res = pd.concat([df_res, pd.DataFrame([totals])], ignore_index=True)
         
-        df_res['Autoconsum (Sala Nova)'] = df_res['Autoconsum SN (kWh)'].apply(lambda x: f"{x:,.0f} kWh".replace(',','.'))
-        df_res['Autoconsum (Pavelló)'] = df_res['Autoconsum PAV (kWh)'].apply(lambda x: f"{x:,.0f} kWh".replace(',','.'))
-        df_res = df_res.drop(columns=['Autoconsum SN (kWh)', 'Autoconsum PAV (kWh)'])
+        # CSV Export Preparation (Before string formatting)
+        csv_data = df_res.to_csv(index=False, sep=';', decimal=',')
+        st.download_button(
+            label="📥 Descarregar Resultats (CSV)",
+            data=csv_data.encode('utf-8-sig'),
+            file_name=f'resultats_cle_optimitzats_{selected_year}.csv',
+            mime='text/csv'
+        )
         
-        st.dataframe(df_res, use_container_width=True)
+        # Format for Display
+        df_display = df_res.copy()
+        df_display['Coeficient Pavelló'] = df_display['Coeficient Pavelló'].apply(lambda x: f"{x:.6f}")
+        df_display['Consum Anual (kWh)'] = df_display['Consum Anual (kWh)'].apply(lambda x: f"{x:,.0f} kWh".replace(',','.'))
+        df_display['Estalvi Anual (€)'] = df_display['Estalvi Anual (€)'].apply(lambda x: f"{x:,.2f} €".replace(',','.'))
+        df_display['Cobertura (%)'] = df_display['Cobertura (%)'].apply(lambda x: f"{x:.1f} %")
+        
+        df_display['Autoconsum (Sala Nova)'] = df_display['Autoconsum SN (kWh)'].apply(lambda x: f"{x:,.0f} kWh".replace(',','.'))
+        df_display['Autoconsum (Pavelló)'] = df_display['Autoconsum PAV (kWh)'].apply(lambda x: f"{x:,.0f} kWh".replace(',','.'))
+        
+        df_display['Excedents Compensats'] = df_display['Excedents Compensats (kWh)'].apply(lambda x: f"{x:,.0f} kWh".replace(',','.'))
+        df_display['Excedents Llençats'] = df_display['Excedents Llençats a la xarxa (kWh)'].apply(lambda x: f"{x:,.0f} kWh".replace(',','.'))
+        df_display['Autoconsum Total'] = df_display['Autoconsum Total (kWh)'].apply(lambda x: f"{x:,.0f} kWh".replace(',','.'))
+        
+        df_display = df_display.drop(columns=[
+            'Autoconsum SN (kWh)', 'Autoconsum PAV (kWh)', 
+            'Excedents Llençats a la xarxa (kWh)', 'Excedents Compensats (kWh)', 'Autoconsum Total (kWh)'
+        ])
+        
+        st.dataframe(df_display, use_container_width=True)
         
         # --- DASHBOARD MENSUAL ---
         st.markdown("### 📊 Dashboard Analític Mensual (Global Ajuntament)")
