@@ -69,6 +69,7 @@ def process_edistribucion_files(uploaded_files):
     for i, file in enumerate(uploaded_files):
         progress_text.text(f"Processant {file.name}...")
         try:
+            file.seek(0) # IMPORTANT: Retornar el buffer a l'inici per si Streamlit l'ha mogut
             df = pd.read_csv(file, sep=';', encoding='latin-1', dtype=str)
             required = ['CUPS', 'Fecha', 'Hora', 'AE_kWh']
             if not all(col in df.columns for col in required):
