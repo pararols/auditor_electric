@@ -255,7 +255,7 @@ def objective_function(coefs, cups_names, df_consum, gen_pavello, gen_salanova, 
     savings_neg, _ = evaluate_coefficients(coefs, cups_names, df_consum, gen_pavello, gen_salanova, prices, excedent_price)
     return savings_neg
 
-def run_optimization(df_consum, prices, excedent_price):
+def run_optimization(df_consum, prices, excedent_price, min_kwp_threshold=0.0):
     cups_names = list(df_consum.columns)
     N = len(cups_names)
     gen_pavello, gen_salanova = load_solar_curves()
@@ -263,8 +263,8 @@ def run_optimization(df_consum, prices, excedent_price):
     # Valors inicials igualitaris
     init_guess = np.ones(N) * (TARGET_RATIO / N)
     
-    # Límits: [0, 1] per cada coef
-    bounds = [(0, 1) for _ in range(N)]
+    # Límits actius variables (podem forçar 0 si pertoca)
+    active_bounds = [(0, 1) for _ in range(N)]
     
     # Restricció: suma de coeficients = TARGET_RATIO
     constraints = {'type': 'eq', 'fun': lambda c: np.sum(c) - TARGET_RATIO}
@@ -282,7 +282,6 @@ def run_optimization(df_consum, prices, excedent_price):
     
     def optimizer_callback(xk):
         iteration_count[0] += 1
-        # Avaluar l'estat actual dels coeficients
         sav_neg, details = evaluate_coefficients(xk, cups_names, df_consum, gen_pavello, gen_salanova, prices, excedent_price)
         
         t_sav = -sav_neg
@@ -290,7 +289,6 @@ def run_optimization(df_consum, prices, excedent_price):
         t_exc_comp = sum(d['Excedents Compensats (kWh)'] for d in details)
         t_exc_lost = sum(d['Excedents Llençats a la xarxa (kWh)'] for d in details)
         
-        # Actualitzar UI
         pl_it.metric("Iteració", f"#{iteration_count[0]}")
         pl_sav.metric("Estalvi Anual", f"{t_sav:,.0f} €".replace(',', '.'))
         pl_aut.metric("Autoconsum", f"{t_aut:,.0f} kWh".replace(',', '.'))
@@ -303,11 +301,44 @@ def run_optimization(df_consum, prices, excedent_price):
             init_guess,
             args=(cups_names, df_consum, gen_pavello, gen_salanova, prices, excedent_price),
             method='SLSQP',
-            bounds=bounds,
+            bounds=active_bounds,
             constraints=constraints,
             callback=optimizer_callback,
             options={'disp': False, 'ftol': 1e-4}
         )
+        
+        # Filtre actiu per micro-assignacions interactiu
+        if min_kwp_threshold > 0:
+            while True:
+                kwp_assigned = opt_res.x * PAVELLO_KWP
+                # Buscar aquells que són positius però insuficients
+                to_exclude = (kwp_assigned > 1e-6) & (kwp_assigned < min_kwp_threshold)
+                if not np.any(to_exclude):
+                    break
+                
+                # Forçar aquests coeficients a 0
+                for i in range(N):
+                    if to_exclude[i]:
+                        active_bounds[i] = (0, 0)
+                        
+                # Nou punt inicial sa per SLSQP
+                active_count = sum(1 for b in active_bounds if b[1] == 1)
+                new_guess = np.zeros(N)
+                if active_count > 0:
+                    for i in range(N):
+                        if active_bounds[i][1] == 1:
+                            new_guess[i] = TARGET_RATIO / active_count
+                            
+                opt_res = minimize(
+                    objective_function, 
+                    new_guess,
+                    args=(cups_names, df_consum, gen_pavello, gen_salanova, prices, excedent_price),
+                    method='SLSQP',
+                    bounds=active_bounds,
+                    constraints=constraints,
+                    callback=optimizer_callback,
+                    options={'disp': False, 'ftol': 1e-4}
+                )
         
     # --- Ajust d'Arrodoniment a 6 Decimals (Legalitat RD 244/2019) ---
     raw_coefs = opt_res.x
@@ -356,6 +387,11 @@ def render_cle_optimizer():
     _, av_years = fetch_and_prep_consumption(2025)
     selected_year = col5.selectbox("Any d'Anàlisi", av_years if av_years else [2025], index=av_years.index(2025) if 2025 in av_years else 0)
     
+    # Opcions avançades
+    st.markdown("#### Exigències Tècniques i Legals")
+    filter_micro = st.checkbox("Excloure coeficients minúsculs (< 0.5 kWp assignats) per simplificar burocràcia i facturació", value=True)
+    min_kwp_val = 0.5 if filter_micro else 0.0
+    
     if st.button("Executar Motor d'Optimització", type="primary"):
         df_consum, years_found = fetch_and_prep_consumption(selected_year)
         if df_consum is None or df_consum.empty:
@@ -368,8 +404,8 @@ def render_cle_optimizer():
             
         prices = calculate_tariffs(df_consum.index, p1, p2, p3)
         
-        # Corre l'optimització
-        detailed_results = run_optimization(df_consum, prices, p_exc)
+        # Corre l'optimització amb el paràmetre de tall de kWp
+        detailed_results = run_optimization(df_consum, prices, p_exc, min_kwp_threshold=min_kwp_val)
         
         # --- PROCESSAMENT RESULTATS ---
         st.success("Optimització finalitzada amb èxit!")
