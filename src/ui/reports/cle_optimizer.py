@@ -414,7 +414,81 @@ def render_cle_optimizer():
         
         # --- PROCESSAMENT RESULTATS ---
         st.success("Optimització finalitzada amb èxit!")
-        st.markdown("### Resultats d'Equilibri Resultants")
+        
+        # --- 1. RESUM EXECUTIU ---
+        st.markdown("### 📊 Resum Executiu Global")
+        
+        # Extracció de Totals Absoluts
+        tot_consum = sum([r['Consum Anual (kWh)'] for r in detailed_results])
+        tot_auto = sum([r['Autoconsum Total (kWh)'] for r in detailed_results])
+        tot_exc_comp = sum([r['Excedents Compensats (kWh)'] for r in detailed_results])
+        tot_exc_lost = sum([r['Excedents Llençats a la xarxa (kWh)'] for r in detailed_results])
+        tot_gen = tot_auto + tot_exc_comp + tot_exc_lost
+        
+        tot_est_auto = sum([r['Estalvi Autoconsum (€)'] for r in detailed_results])
+        tot_est_comp = sum([r['Estalvi Compensació (€)'] for r in detailed_results])
+        tot_est_global = sum([r['Estalvi Anual (€)'] for r in detailed_results])
+        
+        # Càlcul de Percentatges (%)
+        pct_cobertura = (tot_auto / tot_consum * 100) if tot_consum > 0 else 0
+        pct_aprofitament = ((tot_auto + tot_exc_comp) / tot_gen * 100) if tot_gen > 0 else 0
+        
+        # KPI Cards
+        st.write("")
+        col_k1, col_k2, col_k3, col_k4 = st.columns(4)
+        with col_k1:
+            st.metric("💶 Estalvi Econòmic Total", f"{tot_est_global:,.0f} €".replace(',', '.'))
+        with col_k2:
+            st.metric("⚡ Energia Generada (Quota)", f"{tot_gen:,.0f} kWh".replace(',', '.'))
+        with col_k3:
+            st.metric("🛡️ Cobertura Autoconsum", f"{pct_cobertura:.1f} %")
+        with col_k4:
+            st.metric("♻️ Aprofitament de Planta", f"{pct_aprofitament:.1f} %", help="Inclou Autoconsum + Excedents Compensats")
+            
+        st.write("")
+        
+        # Gràfics de Donut Professionals
+        col_g1, col_g2, col_g3 = st.columns(3)
+        
+        # Gràfic 1: Origen de l'Estalvi
+        fig_donut1 = px.pie(
+            names=["Estalvi per Autoconsum", "Descompte per Excedents"],
+            values=[tot_est_auto, tot_est_comp],
+            hole=0.6,
+            color_discrete_sequence=["#2ecc71", "#f1c40f"]
+        )
+        fig_donut1.update_scenes(aspectratio=dict(x=1, y=1, z=1))
+        fig_donut1.update_layout(title_text="Desglossament Econòmic (€)", title_x=0.5, margin=dict(t=40, b=10, l=10, r=10), showlegend=False)
+        fig_donut1.update_traces(textposition='inside', textinfo='percent+label', hovertemplate="%{label}<br>%{value:,.0f} €<extra></extra>")
+        col_g1.plotly_chart(fig_donut1, use_container_width=True)
+        
+        # Gràfic 2: Destí de la Producció
+        fig_donut2 = px.pie(
+            names=["Autoconsum directe", "Excedent Compensat (Venut)", "Excedent Abocat (Perdut)"],
+            values=[tot_auto, tot_exc_comp, tot_exc_lost],
+            hole=0.6,
+            color_discrete_sequence=["#27ae60", "#f39c12", "#e74c3c"]
+        )
+        fig_donut2.update_layout(title_text="Destí Energia Generada (kWh)", title_x=0.5, margin=dict(t=40, b=10, l=10, r=10), showlegend=False)
+        fig_donut2.update_traces(textposition='inside', textinfo='percent+label', hovertemplate="%{label}<br>%{value:,.0f} kWh<extra></extra>")
+        col_g2.plotly_chart(fig_donut2, use_container_width=True)
+        
+        # Gràfic 3: Origen del Consum
+        compra_xarxa = max(0, tot_consum - tot_auto)
+        fig_donut3 = px.pie(
+            names=["Autoconsum Solar", "Compra a la Xarxa"],
+            values=[tot_auto, compra_xarxa],
+            hole=0.6,
+            color_discrete_sequence=["#2ecc71", "#34495e"]
+        )
+        fig_donut3.update_layout(title_text="Procedència del Consum (kWh)", title_x=0.5, margin=dict(t=40, b=10, l=10, r=10), showlegend=False)
+        fig_donut3.update_traces(textposition='inside', textinfo='percent+label', hovertemplate="%{label}<br>%{value:,.0f} kWh<extra></extra>")
+        col_g3.plotly_chart(fig_donut3, use_container_width=True)
+
+        st.markdown("---")
+        
+        # --- 2. TAULA DETALLADA DE PUNTS DE SUBMINISTRAMENT ---
+        st.markdown("### 📋 Resultats Detallats per Equipament")
         
         df_res = pd.DataFrame(detailed_results)
         df_res = df_res.drop(columns=['Mensual'])
