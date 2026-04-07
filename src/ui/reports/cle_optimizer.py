@@ -9,7 +9,7 @@ from src.core.config import COMMUNITY_QUOTAS, COMMUNITY_PARTICIPANTS, CUPS_MAPPI
 from src.core.database import load_from_supabase_db
 
 # Paràmetres globals Subapp
-TARGET_KWP = 83.6979816
+TARGET_KWP = 78.198
 PAVELLO_KWP = 127.2
 TARGET_RATIO = TARGET_KWP / PAVELLO_KWP
 
@@ -370,7 +370,7 @@ def run_optimization(df_consum, prices, excedent_price, min_kwp_threshold=0.0):
 def render_cle_optimizer():
     st.subheader("⚙️ Optimitzador CLE: Assignació Repartiment Pavelló (RD 244/2019)")
     st.markdown("""
-        Aquesta subaplicació determina automàticament els **coeficients fixes ideals anuals** per a la nova instal·lació **FV Pavelló (127.2 kWp)**, amb l'objectiu de distribuir exclusivament la quota reservada per a l'Ajuntament (83.69 kWp).
+        Aquesta subaplicació determina automàticament els **coeficients fixes ideals anuals** per a la nova instal·lació **FV Pavelló (127.2 kWp)**, amb l'objectiu de distribuir exclusivament la quota reservada per a l'Ajuntament (78.198 kWp).
         
         **Criteris aplicats segons normativa ESP:**
         * L'energia provinent de la instal·lació Sala Nova es té en compte prèviament per calcular consums romanents.
