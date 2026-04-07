@@ -230,7 +230,10 @@ def evaluate_coefficients(coefs, cups_names, df_consum, gen_pavello, gen_salanov
         results_by_cups.append({
             'CUPS': cups,
             'Nom': CUPS_MAPPING.get(cups, "Desconegut"),
+            'Coeficient Sala Nova': coef_sn,
+            'Potència Sala Nova (kWp)': coef_sn * 17.1,  # Based on 17.1 total
             'Coeficient Pavelló': coef_pav,
+            'Potència Pavelló (kWp)': coef_pav * PAVELLO_KWP,
             'Consum Anual (kWh)': np.sum(consum),
             'Producció FV (kWh)': np.sum(gen_total),
             'Autoconsum SN (kWh)': total_auto_sn,
@@ -511,7 +514,11 @@ def render_cle_optimizer():
         
         # Format for Display
         df_display = df_res.copy()
+        df_display['Coeficient Sala Nova'] = df_display['Coeficient Sala Nova'].apply(lambda x: f"{x:.6f}" if pd.notnull(x) else "")
+        df_display['Potència Sala Nova (kWp)'] = df_display['Potència Sala Nova (kWp)'].apply(lambda x: f"{x:.2f} kWp" if pd.notnull(x) else "")
         df_display['Coeficient Pavelló'] = df_display['Coeficient Pavelló'].apply(lambda x: f"{x:.6f}")
+        df_display['Potència Pavelló (kWp)'] = df_display['Potència Pavelló (kWp)'].apply(lambda x: f"{x:.2f} kWp" if pd.notnull(x) else "")
+        
         df_display['Consum Anual (kWh)'] = df_display['Consum Anual (kWh)'].apply(lambda x: f"{x:,.0f} kWh".replace(',','.'))
         df_display['Producció FV'] = df_display['Producció FV (kWh)'].apply(lambda x: f"{x:,.0f} kWh".replace(',','.'))
         
@@ -529,7 +536,9 @@ def render_cle_optimizer():
         
         # Defineix l'ordre final
         cols_order = [
-            'CUPS', 'Nom', 'Coeficient Pavelló', 
+            'CUPS', 'Nom', 
+            'Coeficient Sala Nova', 'Potència Sala Nova (kWp)', 
+            'Coeficient Pavelló', 'Potència Pavelló (kWp)',
             'Consum Anual (kWh)', 'Producció FV',
             'Autoconsum (Sala Nova)', 'Autoconsum (Pavelló)', 'Autoconsum Total', 'Cobertura (%)',
             'Excedents Compensats', 'Excedents Llençats',
