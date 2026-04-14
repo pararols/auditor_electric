@@ -55,22 +55,22 @@ def fetch_and_prep_consumption(start_date, end_date):
         cups_name = CUPS_MAPPING.get(cups_id)
         
         # Check if the friendly name is in the DB, fallback to ID just in case
-        if cups_name in df.columns.get_level_values(0):
+        if cups_name in df_raw.columns.get_level_values(0):
             target_col = cups_name
-        elif cups_id in df.columns.get_level_values(0):
+        elif cups_id in df_raw.columns.get_level_values(0):
             target_col = cups_id
         else:
             continue
             
-        cols = df[target_col].columns
+        cols = df_raw[target_col].columns
         ae_col = [c for c in cols if 'AE' in c and 'kWh' in c and 'AUTOCONS' not in c]
         auto_col = [c for c in cols if 'AUTOCONS' in c]
         
-        val_total = pd.Series(0.0, index=df.index)
+        val_total = pd.Series(0.0, index=df_raw.index)
         if ae_col:
-            val_total = val_total.add(df[target_col][ae_col[0]], fill_value=0)
+            val_total = val_total.add(df_raw[target_col][ae_col[0]], fill_value=0)
         if auto_col:
-            val_total = val_total.add(df[target_col][auto_col[0]], fill_value=0)
+            val_total = val_total.add(df_raw[target_col][auto_col[0]], fill_value=0)
             
         cups_data[cups_id] = val_total
         
