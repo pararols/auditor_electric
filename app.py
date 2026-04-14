@@ -17,6 +17,7 @@ from src.ui.views.executive import render_executive_report
 from src.ui.reports.cle_optimizer import render_cle_optimizer
 from src.utils.parsers import parse_processed_csv, process_edistribucion_files
 from src.utils.data_utils import classify_cups_by_name, detect_self_consumption_cups, get_date_range, shift_date
+from src.utils.lighting_analysis import detect_flux_regulation, detect_historical_power_shifts
 
 # Page Config
 st.set_page_config(
@@ -743,6 +744,95 @@ def main():
                     st.plotly_chart(fig_audit, use_container_width=True)
                 else:
                     st.warning("No hi ha dades per aquesta data.")
+
+                # --- NOVES FUNCIONALITATS: ANÀLISI DE CANVIS I REGULACIÓ ---
+                st.markdown("---")
+                st.subheader("🚀 Anàlisi Avançada: Canvis i Regulació")
+                
+                if st.button("Executar Anàlisi de Canvis i Regulació"):
+                    with st.spinner("Analitzant patrons de regulació i reformes històriques..."):
+                        # 1. Carregar dades de lluminàries des de l'Excel
+                        try:
+                            df_llum = pd.read_excel(r'c:\Users\parar\OneDrive\Documents\antigravity\auditor electric\llistat lluminaries.xlsx')
+                            llum_map = df_llum.set_index('CUPS')['LLUNINARIES TOTALS'].to_dict()
+                        except Exception as e:
+                            st.error(f"Error carregant l'Excel de lluminàries: {e}")
+                            llum_map = {}
+
+                        regulation_results = []
+                        historical_shifts = []
+
+                        rev_map = {v: k for k, v in CUPS_MAPPING.items()}
+
+                        for cup_name in lighting_selected:
+                            cups_id = rev_map.get(cup_name, cup_name)
+                            n_llun = llum_map.get(cups_id, 0)
+                            
+                            if cup_name not in df.columns.get_level_values(0): continue
+                            cols = df[cup_name].columns
+                            ae_col = [c for c in cols if 'AE' in c and 'kWh' in c and 'AUTOCONS' not in c]
+                            if not ae_col: continue
+                            
+                            series = df[cup_name][ae_col[0]]
+                            
+                            # A. Anàlisi Regulació (Última nit amb dades completes)
+                            reg_data = detect_flux_regulation(series)
+                            if reg_data and reg_data['is_regulated']:
+                                regulation_results.append({
+                                    "CUPS": cup_name,
+                                    "P. Inst. (kW)": f"{reg_data['p_installed']:.2f}",
+                                    "P. Red. (kW)": f"{reg_data['p_reduced']:.2f}",
+                                    "Reducció": f"{reg_data['reduction_pct']:.0f}%",
+                                    "Horari": f"{min(reg_data['hours'])}h - {max(reg_data['hours'])}h"
+                                })
+
+                            # B. Anàlisi Canvis Històrics (Retrofitting > 15%)
+                            shifts = detect_historical_power_shifts(series)
+                            for s in shifts:
+                                row_s = {
+                                    "Data": s['date'],
+                                    "CUPS": cup_name,
+                                    "P. Anterior (kW)": f"{s['p_old']:.2f}",
+                                    "P. Nova (kW)": f"{s['p_new']:.2f}",
+                                    "Estalvi (kW)": f"{abs(s['change_kw']):.2f} kW",
+                                    "Reducció (%)": f"{abs(s['change_pct']):.1f}%"
+                                }
+                                # Càlcul per lluminària si tenim el mapa
+                                if n_llun > 0:
+                                    w_per_point = (abs(s['change_kw']) * 1000) / n_llun
+                                    row_s["Estalvi/Punt (W)"] = f"{w_per_point:.1f} W"
+                                else:
+                                    row_s["Estalvi/Punt (W)"] = "N/A"
+                                
+                                historical_shifts.append(row_s)
+
+                        # Render Resultats
+                        col_r1, col_r2 = st.columns(2)
+                        
+                        with col_r1:
+                            st.write("#### 🌙 Regulació de Fluxe Detectada")
+                            if regulation_results:
+                                st.table(pd.DataFrame(regulation_results))
+                            else:
+                                st.info("No s'han detectat patrons de regulació significatius.")
+
+                        with col_r2:
+                            st.write("#### 🎯 Eficiència per Punt de Llum")
+                            # Show summary of points per CUPS for transparency
+                            llum_summary = []
+                            for c_name in lighting_selected:
+                                cid = rev_map.get(c_name, c_name)
+                                if cid in llum_map:
+                                    llum_summary.append({"CUPS": c_name, "Punts de Llum": int(llum_map[cid])})
+                            if llum_summary:
+                                st.dataframe(pd.DataFrame(llum_summary), hide_index=True)
+
+                        st.write("#### 📈 Canvis Històrics de Potència (Reformes / LED)")
+                        if historical_shifts:
+                            df_h = pd.DataFrame(historical_shifts)
+                            st.dataframe(df_h.sort_values(by="Data", ascending=False), use_container_width=True, hide_index=True)
+                        else:
+                            st.info("No s'han detectat canvis permanents de potència (>15%) en l'històric.")
 
         # --- Tab 4: AI Advisor ---
         with tab4:
