@@ -12,7 +12,7 @@ from pathlib import Path
 
 # --- MODULAR IMPORTS ---
 from src.core.config import CUPS_MAPPING, COMMUNITY_PARTICIPANTS, month_names, month_names_short, PAGE_TITLE, PAGE_ICON, apply_custom_styles
-from src.core.database import init_supabase, load_fv_sala_nova_data, load_from_supabase_db, sync_csv_to_db, get_inventory_fixtures, sync_fixtures_to_db
+from src.core.database import init_supabase, load_fv_sala_nova_data, load_from_supabase_db, sync_csv_to_db
 from src.ui.layout import render_login, render_sidebar, init_session_state
 from src.ui.views.executive import render_executive_report
 from src.ui.reports.cle_optimizer import render_cle_optimizer
@@ -752,26 +752,16 @@ def main():
                 
                 if st.button("Executar Anàlisi de Canvis i Regulació"):
                     with st.spinner("Analitzant patrons de regulació i reformes històriques..."):
-                        # 1. Carregar dades de lluminàries (Prioritat Supabase > Excel)
-                        df_llum = get_inventory_fixtures()
-                        
-                        # Si Supabase està buit, intentem Excel (Sòls en local)
-                        excel_path = r'c:\Users\parar\OneDrive\Documents\antigravity\auditor electric\llistat lluminaries.xlsx'
-                        if df_llum.empty:
-                            try:
-                                df_llum = pd.read_excel(excel_path)
-                                st.info("ℹ️ S'han carregat dades de l'Excel local.")
-                            except Exception:
-                                pass # No fem soroll si falla l'excel (pot estar en producció)
-
-                        if df_llum.empty:
-                            st.warning("⚠️ No s'ha trobat l'inventari de lluminàries a la Base de Dades ni a l'Excel local. Els càlculs per punt de llum no estaran disponibles.")
+                        # 1. Carregar inventari de lluminàries des del fitxer JSON local (bundled amb el codi)
+                        import json
+                        _json_path = Path(__file__).parent / "src" / "data" / "lighting_inventory.json"
+                        try:
+                            with open(_json_path, encoding='utf-8') as _f:
+                                _data = json.load(_f)
+                            llum_map = {item['CUPS']: item['LLUNINARIES TOTALS'] for item in _data}
+                        except Exception as _e:
+                            st.warning(f"⚠️ No s'ha pogut carregar l'inventari de lluminàries: {_e}")
                             llum_map = {}
-                        else:
-                            llum_map = df_llum.set_index('CUPS')['LLUNINARIES TOTALS'].to_dict()
-                            # Botó de Sincronització (només si l'Excel existeix i la BD està buida/desactualitzada)
-                            # Nota: st.button dins de spinner no és ideal, però aquí s'executa si df_llum prové de l'excel.
-                            # Millor posar la lògica de sync fora o en un expander a sota.
 
                         regulation_results = []
                         historical_shifts = []
@@ -848,20 +838,7 @@ def main():
                         else:
                             st.info("No s'han detectat canvis permanents de potència (>15%) en l'històric.")
 
-                # --- SECCIÓ DE SINCRONITZACIÓ (Només visible si hi ha Excel local) ---
-                try:
-                    excel_full_path = r'c:\Users\parar\OneDrive\Documents\antigravity\auditor electric\llistat lluminaries.xlsx'
-                    if Path(excel_full_path).exists():
-                        with st.expander("⚙️ Gestió dades inventari (Admin)", expanded=False):
-                            st.info("S'ha detectat el fitxer Excel local amb l'inventari de lluminàries.")
-                            if st.button("💾 Sincronitzar Excel a Base de Dades (Supabase)"):
-                                df_xl = pd.read_excel(excel_full_path)
-                                success = sync_fixtures_to_db(df_xl)
-                                if success:
-                                    st.success("Inventari sincronitzat correctament a Supabase! Ara l'app funcionarà en qualsevol entorn.")
-                                    st.rerun()
-                except:
-                    pass
+
 
         # --- Tab 4: AI Advisor ---
         with tab4:
