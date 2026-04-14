@@ -564,7 +564,7 @@ def render_cle_optimizer():
         st.download_button(
             label="📥 Descarregar Resultats (CSV)",
             data=csv_data.encode('utf-8-sig'),
-            file_name=f'resultats_cle_optimitzats_{selected_year}.csv',
+            file_name=f'resultats_cle_optimitzats_{end_date.year}.csv',
             mime='text/csv'
         )
         
