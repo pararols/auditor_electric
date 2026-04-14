@@ -886,99 +886,121 @@ def main():
                     # --- PROJECCIÓ 2026 ---
                     st.markdown("---")
                     st.subheader("📊 Projecció de Consum 2026 per Millora LED")
+                    st.markdown(
+                        "Defineix la **reducció de potència (%)** per cada zona. "
+                        "El valor es pre-omple amb la reducció detectada a l'anàlisi (si s'ha detectat). "
+                        "Pots editar-lo manualment. Finalment prem **Calcular Projecció**."
+                    )
 
+                    # Mapa de reduccions detectades automàticament
+                    detected_reductions = {}
                     if historical_shifts:
-                        df_shifts = pd.DataFrame(historical_shifts)
-                        # CUPS únics amb canvis detectats
-                        cups_with_shifts = df_shifts['CUPS'].unique().tolist()
+                        _df_sh = pd.DataFrame(historical_shifts)
+                        for _cup in _df_sh['CUPS'].unique():
+                            _cd = _df_sh[_df_sh['CUPS'] == _cup]
+                            detected_reductions[_cup] = float(_cd['_reduction_ratio'].max() * 100)
 
-                        st.markdown(
-                            "Selecciona els CUPS que han realitzat una **millora LED** i es vol fer la projecció 2026. "
-                            "S'aplicarà la reducció de potència detectada sobre el consum real de 2024."
+                    preu_kwh = st.number_input(
+                        "Preu energia (€/kWh):",
+                        min_value=0.01, max_value=1.00, value=0.15, step=0.01, format="%.3f",
+                        key="preu_kwh_proj"
+                    )
+
+                    # Construcció taula editable
+                    proj_input_rows = []
+                    for cup_name in lighting_selected:
+                        kwh_2024 = consumption_2024.get(cup_name, 0.0)
+                        # Recalcular si 0 (la sèrie pot ser AE kWh ja acumulat, no dividir per 4)
+                        if kwh_2024 <= 0 and cup_name in df.columns.get_level_values(0):
+                            try:
+                                _cols = df[cup_name].columns
+                                _ae = [c for c in _cols if 'AE' in c and 'kWh' in c and 'AUTOCONS' not in c]
+                                if _ae:
+                                    _s = df[cup_name][_ae[0]]
+                                    _s24 = _s[_s.index.year == 2024]
+                                    kwh_2024 = float(_s24.sum()) if not _s24.empty else 0.0
+                            except:
+                                kwh_2024 = 0.0
+
+                        red_pct = round(detected_reductions.get(cup_name, 0.0), 1)
+                        proj_input_rows.append({
+                            "CUPS / Zona": cup_name,
+                            "kWh real 2024": round(kwh_2024),
+                            "% Reducció LED": red_pct
+                        })
+
+                    df_input = pd.DataFrame(proj_input_rows)
+                    df_edited = st.data_editor(
+                        df_input,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "CUPS / Zona": st.column_config.TextColumn("CUPS / Zona", disabled=True),
+                            "kWh real 2024": st.column_config.NumberColumn(
+                                "kWh real 2024", disabled=True, format="%,.0f"
+                            ),
+                            "% Reducció LED": st.column_config.NumberColumn(
+                                "% Reducció LED",
+                                min_value=0.0, max_value=100.0, step=0.5, format="%.1f",
+                                help="0 = cap canvi; 30 = 30% menys consum respecte 2024"
+                            )
+                        },
+                        key="proj_editor"
+                    )
+
+                    if st.button("📊 Calcular Projecció 2026", key="btn_calc_proj"):
+                        _rows = []
+                        for _, _r in df_edited.iterrows():
+                            _kwh24 = float(_r["kWh real 2024"])
+                            _red = float(_r["% Reducció LED"]) / 100.0
+                            if _kwh24 <= 0:
+                                continue
+                            _kwh26 = _kwh24 * (1 - _red)
+                            _estalvi = _kwh24 - _kwh26
+                            _rows.append({
+                                "CUPS / Zona": _r["CUPS / Zona"],
+                                "kWh real 2024": round(_kwh24),
+                                "% Reducció": f"{_red*100:.1f}%",
+                                "Projecció kWh 2026": round(_kwh26),
+                                "Estalvi kWh": round(_estalvi),
+                                "Estalvi €": round(_estalvi * preu_kwh, 2)
+                            })
+                        st.session_state['proj_results'] = _rows
+                        st.session_state['proj_preu'] = preu_kwh
+
+                    if st.session_state.get('proj_results'):
+                        _proj = st.session_state['proj_results']
+                        df_proj = pd.DataFrame(_proj)
+
+                        _t24 = df_proj["kWh real 2024"].sum()
+                        _t26 = df_proj["Projecció kWh 2026"].sum()
+                        _te = df_proj["Estalvi kWh"].sum()
+                        _teur = df_proj["Estalvi €"].sum()
+
+                        st.dataframe(df_proj, use_container_width=True, hide_index=True)
+
+                        k1, k2, k3, k4 = st.columns(4)
+                        k1.metric("Total kWh 2024", f"{_t24:,.0f} kWh")
+                        k2.metric("Projecció 2026", f"{_t26:,.0f} kWh",
+                                  delta=f"-{_te:,.0f} kWh", delta_color="inverse")
+                        k3.metric("Estalvi Total", f"{_te:,.0f} kWh")
+                        k4.metric("Estalvi €", f"{_teur:,.0f} €")
+
+                        _fig = go.Figure()
+                        _fig.add_trace(go.Bar(
+                            name="kWh real 2024", x=df_proj["CUPS / Zona"],
+                            y=df_proj["kWh real 2024"], marker_color='#636EFA'
+                        ))
+                        _fig.add_trace(go.Bar(
+                            name="Projecció kWh 2026", x=df_proj["CUPS / Zona"],
+                            y=df_proj["Projecció kWh 2026"], marker_color='#00CC96'
+                        ))
+                        _fig.update_layout(
+                            title="Comparativa Consum Real 2024 vs Projecció 2026 (post-LED)",
+                            barmode='group', xaxis_title="CUPS / Zona", yaxis_title="kWh",
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02)
                         )
-
-                        selected_led_cups = st.multiselect(
-                            "CUPS amb millora LED confirmada:",
-                            options=cups_with_shifts,
-                            default=cups_with_shifts,
-                            key="led_projection_cups"
-                        )
-
-                        # Preu energia (editable)
-                        preu_kwh = st.number_input(
-                            "Preu energia (€/kWh) per càlcul d'estalvi econòmic:",
-                            min_value=0.01, max_value=1.00, value=0.15, step=0.01, format="%.3f"
-                        )
-
-                        if selected_led_cups:
-                            projection_rows = []
-
-                            for cup_name in selected_led_cups:
-                                cup_shifts = df_shifts[df_shifts['CUPS'] == cup_name]
-                                if cup_shifts.empty: continue
-
-                                # Agafar la reducció màxima detectada (la més significativa)
-                                max_reduction = cup_shifts['_reduction_ratio'].max()
-                                kwh_2024 = consumption_2024.get(cup_name, 0)
-
-                                if kwh_2024 == 0: continue
-
-                                kwh_2026_proj = kwh_2024 * (1 - max_reduction)
-                                kwh_estalvi = kwh_2024 - kwh_2026_proj
-                                eur_estalvi = kwh_estalvi * preu_kwh
-
-                                projection_rows.append({
-                                    "CUPS / Zona": cup_name,
-                                    "kWh real 2024": round(kwh_2024, 0),
-                                    "Reducció LED (%)": f"{max_reduction*100:.1f}%",
-                                    "Projecció kWh 2026": round(kwh_2026_proj, 0),
-                                    "Estalvi kWh": round(kwh_estalvi, 0),
-                                    f"Estalvi € ({preu_kwh:.3f} €/kWh)": round(eur_estalvi, 2)
-                                })
-
-                            if projection_rows:
-                                df_proj = pd.DataFrame(projection_rows)
-
-                                # Totals
-                                total_kwh_2024 = df_proj["kWh real 2024"].sum()
-                                total_kwh_2026 = df_proj["Projecció kWh 2026"].sum()
-                                total_estalvi_kwh = df_proj["Estalvi kWh"].sum()
-                                total_estalvi_eur = df_proj[f"Estalvi € ({preu_kwh:.3f} €/kWh)"].sum()
-
-                                st.dataframe(df_proj, use_container_width=True, hide_index=True)
-
-                                # KPIs resum
-                                k1, k2, k3, k4 = st.columns(4)
-                                k1.metric("Total kWh 2024", f"{total_kwh_2024:,.0f} kWh")
-                                k2.metric("Projecció 2026", f"{total_kwh_2026:,.0f} kWh",
-                                          delta=f"-{total_estalvi_kwh:,.0f} kWh", delta_color="inverse")
-                                k3.metric("Estalvi Total", f"{total_estalvi_kwh:,.0f} kWh")
-                                k4.metric("Estalvi Econòmic", f"{total_estalvi_eur:,.0f} €")
-
-                                # Gràfic de barres comparatiu
-                                fig_proj = go.Figure()
-                                fig_proj.add_trace(go.Bar(
-                                    name="kWh real 2024",
-                                    x=df_proj["CUPS / Zona"],
-                                    y=df_proj["kWh real 2024"],
-                                    marker_color='#636EFA'
-                                ))
-                                fig_proj.add_trace(go.Bar(
-                                    name="Projecció kWh 2026",
-                                    x=df_proj["CUPS / Zona"],
-                                    y=df_proj["Projecció kWh 2026"],
-                                    marker_color='#00CC96'
-                                ))
-                                fig_proj.update_layout(
-                                    title="Comparativa Consum Real 2024 vs Projecció 2026 (post-LED)",
-                                    barmode='group',
-                                    xaxis_title="CUPS / Zona",
-                                    yaxis_title="kWh",
-                                    legend=dict(orientation="h", yanchor="bottom", y=1.02)
-                                )
-                                st.plotly_chart(fig_proj, use_container_width=True)
-                    else:
-                        st.info("Primer executeu l'anàlisi per detectar canvis de potència que permetin la projecció.")
+                        st.plotly_chart(_fig, use_container_width=True)
 
         # --- Tab 4: AI Advisor ---
         with tab4:
