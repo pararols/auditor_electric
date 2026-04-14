@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 from scipy.optimize import minimize
 from pathlib import Path
 from src.core.config import COMMUNITY_QUOTAS, COMMUNITY_PARTICIPANTS, CUPS_MAPPING
-from src.core.database import load_from_supabase_db
+from src.core.database import load_from_supabase_db, get_last_complete_day_all_cups
 
 # Paràmetres globals Subapp
 TARGET_KWP = 78.198
@@ -14,46 +14,39 @@ PAVELLO_KWP = 127.2
 TARGET_RATIO = TARGET_KWP / PAVELLO_KWP
 
 def load_solar_curves():
-    """Carrega les corbes de generació anual del Pavelló (127.2 kWp) i Sala Nova (17.1 kWp)."""
-    # Usar camí relatiu a l'arrel del projecte (on estan els CSVs)
-    # cle_optimizer.py està a src/ui/reports/, l'arrel és 3 nivells amunt
+    """Carrega les corbes de generació anual del Pavelló (127.2 kWp) i Sala Nova (17.1 kWp).
+    Retorna dos Series amb índex Datetime (any 2025 fictici per a mapping).
+    """
     base_path = Path(__file__).parents[3]
     
     # Pavello
     df_pav = pd.read_csv(base_path / "modelpavello.csv", sep=";", decimal=",")
-    df_pav = df_pav.dropna(subset=['Produccio FV kWh']) # drop trailing empty rows if any
+    df_pav = df_pav.dropna(subset=['Produccio FV kWh'])
     
     # Sala nova
     df_sala = pd.read_csv(base_path / "modelsalanova.csv", sep=";", decimal=",")
     df_sala = df_sala.dropna(subset=['Produccio FV kWh'])
     
-    # Garantir que tenen 8760 hores (un any no de traspàs)
-    gen_pavello = df_pav['Produccio FV kWh'].values[:8760]
-    gen_salanova = df_sala['Produccio FV kWh'].values[:8760]
+    # Crear índex temporal 2025 (no traspàs) per a 8760 hores
+    idx_2025 = pd.date_range("2025-01-01 00:00:00", "2025-12-31 23:00:00", freq="h")
+    
+    gen_pavello = pd.Series(df_pav['Produccio FV kWh'].values[:8760], index=idx_2025)
+    gen_salanova = pd.Series(df_sala['Produccio FV kWh'].values[:8760], index=idx_2025)
     
     return gen_pavello, gen_salanova
 
 @st.cache_data(ttl=3600)
-def fetch_and_prep_consumption(year=2025):
-    """Carrega el consum horari de l'any objectiu per als CUPS municipals."""
-    # Primer, obtenim els anys disponibles de forma lleugera si cal, 
-    # però per agilitzar, fem una crida específica per l'any demanat.
-    start_str = f"{year}-01-01"
-    end_str = f"{year}-12-31"
+def fetch_and_prep_consumption(start_date, end_date):
+    """Carrega el consum horari per a un període de 1 any per als CUPS municipals."""
+    # start_date, end_date són objectes date o strings 'YYYY-MM-DD'
+    start_str = start_date.strftime('%Y-%m-%d') if hasattr(start_date, 'strftime') else start_date
+    end_str = end_date.strftime('%Y-%m-%d') if hasattr(end_date, 'strftime') else end_date
     
-    # Carreguem només l'any que ens interessa per no topar amb el límit de 200k files
+    # Carreguem dades de Supabase pel rang especificat
     df_raw = load_from_supabase_db(start_date=start_str, end_date=end_str)
     
-    # Per saber els anys disponibles a tota la DB (pel selector), 
-    # podríem fer una altra crida o heretar-ho. 
-    # De moment, si no hi ha dades per aquest any, mirem si n'hi ha en general.
     if df_raw is None or df_raw.empty:
-        # Consulta ràpida de tots els anys (això podria fallar pel límit, millor rpc)
-        # Però per ara, si no hi ha 2025, retornem buit.
-        return None, []
-        
-    df = df_raw.copy()
-    available_years = [year] # Simplified since we filtered at source
+        return None
     
     # Reconstruir el consum total (Xarxa + Autoconsum existent de Sala Nova)
     cups_data = {}
@@ -81,15 +74,27 @@ def fetch_and_prep_consumption(year=2025):
             
         cups_data[cups_id] = val_total
         
-    if not cups_data:
-        return None, available_years
-        
     df_final = pd.DataFrame(cups_data)
-    full_index = pd.date_range(start=f"{year}-01-01 00:00:00", end=f"{year}-12-31 23:00:00", freq='h')
+    
+    # Generar índex complet per a l'any seleccionat (8760-8784 hores depenent de traspàs)
+    # Per simplificar a l'optimitzador, forçarem 8760 punts basant-nos en el rang
+    full_index = pd.date_range(start=f"{start_str} 00:00:00", end=f"{end_str} 23:00:00", freq='h')
+    
+    # Si és any de traspàs o hi ha desviaments horaris, re-calculem per tenir un any estàndard per a la comparativa solar
+    # (L'algorisme està dissenyat per a vectors de 8760)
     df_final = df_final.groupby(df_final.index).mean()
     df_final = df_final.reindex(full_index, fill_value=0)
     
-    return df_final, available_years
+    # Ens quedem amb exactament 8760 hores per al motor
+    if len(df_final) > 8760:
+        df_final = df_final.iloc[:8760]
+    elif len(df_final) < 8760:
+        # Pad with zeros if data is incomplete
+        pad_size = 8760 - len(df_final)
+        pad_df = pd.DataFrame(0.0, index=range(pad_size), columns=df_final.columns)
+        df_final = pd.concat([df_final, pad_df]).fillna(0)
+    
+    return df_final
 
 def calculate_tariffs(full_index, p1=0.22, p2=0.147, p3=0.11):
     """Construeix el vector de tarifes P1/P2/P3 segons calendari peninsular."""
@@ -261,7 +266,23 @@ def objective_function(coefs, cups_names, df_consum, gen_pavello, gen_salanova, 
 def run_optimization(df_consum, prices, excedent_price, min_kwp_threshold=0.0):
     cups_names = list(df_consum.columns)
     N = len(cups_names)
-    gen_pavello, gen_salanova = load_solar_curves()
+    
+    # Carregar corbes model (8760h)
+    gen_pav_model, gen_sn_model = load_solar_curves()
+    
+    # Alineació Intel·ligent: Mapejar cada hora del consum a la seva hora equivalent del model solar
+    # (Ignorem l'any i ens fixem en Mes-Dia-Hora)
+    def align_solar(model_series, target_index):
+        # Creem una clau 'month-day-hour' per al model
+        m_keys = model_series.index.strftime('%m-%d-%H')
+        m_map = dict(zip(m_keys, model_series.values))
+        
+        # Mapegem l'índex de consum
+        t_keys = target_index.strftime('%m-%d-%H')
+        return np.array([m_map.get(k, 0.0) for k in t_keys])
+
+    gen_pavello = align_solar(gen_pav_model, df_consum.index)
+    gen_salanova = align_solar(gen_sn_model, df_consum.index)
     
     # Valors inicials igualitaris
     init_guess = np.ones(N) * (TARGET_RATIO / N)
@@ -366,8 +387,27 @@ def run_optimization(df_consum, prices, excedent_price, min_kwp_threshold=0.0):
     return detailed_results
 
     
-@st.fragment
 def render_cle_optimizer():
+    # Estils d'impressió CSS (Amagar barra lateral i botons)
+    st.markdown("""
+        <style>
+        @media print {
+            section[data-testid="stSidebar"], 
+            .stHeader, 
+            header,
+            footer,
+            .stButton,
+            div[data-testid="stDownloadButton"] {
+                display: none !important;
+            }
+            .main .block-container {
+                padding: 0 !important;
+                max-width: 100% !important;
+            }
+        }
+        </style>
+    """, unsafe_allow_html=True)
+    
     st.subheader("⚙️ Optimitzador CLE: Assignació Repartiment Pavelló (RD 244/2019)")
     st.markdown("""
         Aquesta subaplicació determina automàticament els **coeficients fixes ideals anuals** per a la nova instal·lació **FV Pavelló (127.2 kWp)**, amb l'objectiu de distribuir exclusivament la quota reservada per a l'Ajuntament (78.198 kWp).
@@ -381,33 +421,49 @@ def render_cle_optimizer():
     
     st.markdown("#### Paràmetres d'Anàlisi i Opcions Legals")
     
+    # 1. Trobar data límit per defecte
+    municipal_cups_ids = [k for k, v in CUPS_MAPPING.items() if not str(v).startswith("Part. Privat")]
+    default_end_date = get_last_complete_day_all_cups(municipal_cups_ids)
+    
+    # 2. UI Selector de Període
+    col0, col1, col2, col3, col4 = st.columns([2, 1, 1, 1, 1.5])
+    with col0:
+        end_date = st.date_input("Analitzar període de 1 any fins a:", value=default_end_date or pd.Timestamp.now().date())
+        start_date = end_date - pd.Timedelta(days=364)
+        st.info(f"Rang d'anàlisi: {start_date.strftime('%d/%m/%Y')} - {end_date.strftime('%d/%m/%Y')}")
+
     # Nova sub-opció ben visible a dalt (Poda de <0.5 kWp)
-    filter_micro = st.checkbox("Excloure assignacions minúscules (< 0.5 kWp de potència equivalent) per simplificar càrrega administrativa municipal", value=True)
+    filter_micro = col4.checkbox("Excloure < 0.5 kWp", value=True, help="Simplifica la gestió administrativa municipal")
     min_kwp_val = 0.5 if filter_micro else 0.0
     
     st.write("") # Separador
     
     # UI Constants
-    col1, col2, col3, col4, col5 = st.columns(5)
-    p1 = col1.number_input("Preu P1 (€/kWh)", value=0.22, format="%.3f")
-    p2 = col2.number_input("Preu P2 (€/kWh)", value=0.147, format="%.3f")
-    p3 = col3.number_input("Preu P3 (€/kWh)", value=0.11, format="%.3f")
-    p_exc = col4.number_input("Compensació Excedents (€)", value=0.07, format="%.3f")
+    p1 = col1.number_input("Preu P1 (€)", value=0.22, format="%.3f")
+    p2 = col2.number_input("Preu P2 (€)", value=0.147, format="%.3f")
+    p3 = col3.number_input("Preu P3 (€)", value=0.11, format="%.3f")
+    # p_exc = col4.number_input("Comp. (€)", value=0.07, format="%.3f") # Removed col4 to refactor
     
-    # Fem consulta ràpida per saber quins anys hi ha
-    _, av_years = fetch_and_prep_consumption(2025)
-    selected_year = col5.selectbox("Any d'Anàlisi", av_years if av_years else [2025], index=av_years.index(2025) if 2025 in av_years else 0)
-    
+    col_a, col_b = st.columns([1, 4])
+    p_exc = col_a.number_input("Compensació Excedents (€)", value=0.07, format="%.3f")
+
     st.write("") # Separador
     
-    if st.button("Executar Motor d'Optimització", type="primary"):
-        df_consum, years_found = fetch_and_prep_consumption(selected_year)
+    col_run, col_print = st.columns([1, 4])
+    run_btn = col_run.button("Executar Motor d'Optimització", type="primary")
+    
+    # Botó d'impressió amb JS
+    if col_print.button("🖨️ Imprimir resultats"):
+        st.components.v1.html("""
+            <script>
+                window.print();
+            </script>
+        """, height=0)
+
+    if run_btn:
+        df_consum = fetch_and_prep_consumption(start_date, end_date)
         if df_consum is None or df_consum.empty:
-            st.error(f"No s'han trobat dades de consum suficients per als CUPS municipals per l'any {selected_year}.")
-            if years_found:
-                 st.info(f"Anys disponibles a la base de dades: {', '.join(map(str, years_found))}")
-            else:
-                 st.warning("La base de dades sembla estar buida o no s'ha pogut carregar.")
+            st.error(f"No s'han trobat dades de consum suficients per al període seleccionat.")
             return
             
         prices = calculate_tariffs(df_consum.index, p1, p2, p3)

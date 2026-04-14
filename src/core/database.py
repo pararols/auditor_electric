@@ -107,8 +107,45 @@ def load_from_supabase_db(start_date=None, end_date=None):
         data_df.index.name = 'Datetime'
         return data_df
         
+@st.cache_data(ttl=3600)
+def get_last_complete_day_all_cups(target_cups_ids=None):
+    """
+    Finds the latest date in Supabase where data is available. 
+    If target_cups_ids is provided, it specifically searches for the last date 
+    where ALL those CUPS have at least one entry in the 'data' JSONB.
+    """
+    supabase = init_supabase()
+    if not supabase: return None
+    
+    try:
+        # Fetch the very last 500 rows to find a recent point
+        res = supabase.table("energy_readings_wide").select("reading_time, data").order("reading_time", desc=True).limit(500).execute()
+        if not res.data: return None
+        
+        if not target_cups_ids:
+            # Just return the absolute latest date if no filter is provided
+            dt = pd.to_datetime(res.data[0]['reading_time']).tz_localize(None)
+            return dt.date()
+            
+        # Search backwards for the first row that has all target keys
+        for row in res.data:
+            data_keys = row['data'].keys()
+            # The keys in 'data' are stored as CUPS___Variable (e.g. ES123___AE)
+            # We check if any keys start with the target CUPS
+            present_cups = set()
+            for k in data_keys:
+                if "___" in k:
+                    present_cups.add(k.split("___")[0])
+            
+            if all(cups in present_cups for cups in target_cups_ids):
+                dt = pd.to_datetime(row['reading_time']).tz_localize(None)
+                return dt.date()
+                
+        # Fallback to the absolute latest if search fails
+        return pd.to_datetime(res.data[0]['reading_time']).date()
+        
     except Exception as e:
-        st.error(f"Error carregant de Supabase: {e}")
+        st.error(f"Error detectant darrera data: {e}")
         return None
 
 def sync_csv_to_db(df, mode="merge"):
