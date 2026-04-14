@@ -748,11 +748,20 @@ def main():
 
                 # --- NOVES FUNCIONALITATS: ANÀLISI DE CANVIS I REGULACIÓ ---
                 st.markdown("---")
-                st.subheader("🚀 Anàlisi Avançada: Canvis i Regulació")
-                
-                if st.button("Executar Anàlisi de Canvis i Regulació"):
+                st.subheader("🚀 Anàlisi Avançada: Canvis i Regulació d'Enllumenat")
+
+                # Inicialitzar session_state per persistir resultats
+                if 'lighting_analysis_done' not in st.session_state:
+                    st.session_state.lighting_analysis_done = False
+                if 'lighting_regulation' not in st.session_state:
+                    st.session_state.lighting_regulation = []
+                if 'lighting_shifts' not in st.session_state:
+                    st.session_state.lighting_shifts = []
+                if 'lighting_consumption_2024' not in st.session_state:
+                    st.session_state.lighting_consumption_2024 = {}
+
+                if st.button("🔍 Executar Anàlisi de Canvis i Regulació"):
                     with st.spinner("Analitzant patrons de regulació i reformes històriques..."):
-                        # 1. Carregar inventari de lluminàries des del fitxer JSON local (bundled amb el codi)
                         import json
                         _json_path = Path(__file__).parent / "src" / "data" / "lighting_inventory.json"
                         try:
@@ -765,21 +774,28 @@ def main():
 
                         regulation_results = []
                         historical_shifts = []
+                        consumption_2024 = {}  # cups_name -> kWh 2024
 
                         rev_map = {v: k for k, v in CUPS_MAPPING.items()}
 
                         for cup_name in lighting_selected:
                             cups_id = rev_map.get(cup_name, cup_name)
                             n_llun = llum_map.get(cups_id, 0)
-                            
+
                             if cup_name not in df.columns.get_level_values(0): continue
                             cols = df[cup_name].columns
                             ae_col = [c for c in cols if 'AE' in c and 'kWh' in c and 'AUTOCONS' not in c]
                             if not ae_col: continue
-                            
+
                             series = df[cup_name][ae_col[0]]
-                            
-                            # A. Anàlisi Regulació (Última nit amb dades completes)
+
+                            # Consum real 2024 (kWh totals)
+                            series_2024 = series[series.index.year == 2024]
+                            # Cada registre és 15 min -> dividir per 4 per obtenir kWh
+                            kwh_2024 = float(series_2024.sum() / 4) if not series_2024.empty else 0.0
+                            consumption_2024[cup_name] = kwh_2024
+
+                            # A. Anàlisi Regulació
                             reg_data = detect_flux_regulation(series)
                             if reg_data and reg_data['is_regulated']:
                                 regulation_results.append({
@@ -790,55 +806,179 @@ def main():
                                     "Horari": f"{min(reg_data['hours'])}h - {max(reg_data['hours'])}h"
                                 })
 
-                            # B. Anàlisi Canvis Històrics (Retrofitting > 15%)
+                            # B. Canvis Històrics (Retrofitting >15%)
                             shifts = detect_historical_power_shifts(series)
                             for s in shifts:
+                                # Reducció % (negatiu = millora)
+                                change_pct = s['change_pct']  # negatiu si ha baixat
                                 row_s = {
                                     "Data": s['date'],
                                     "CUPS": cup_name,
-                                    "P. Anterior (kW)": f"{s['p_old']:.2f}",
-                                    "P. Nova (kW)": f"{s['p_new']:.2f}",
-                                    "Estalvi (kW)": f"{abs(s['change_kw']):.2f} kW",
-                                    "Reducció (%)": f"{abs(s['change_pct']):.1f}%"
+                                    "P. Anterior (kW)": round(s['p_old'], 3),
+                                    "P. Nova (kW)": round(s['p_new'], 3),
+                                    "Estalvi (kW)": round(abs(s['change_kw']), 3),
+                                    "Reducció (%)": round(abs(change_pct), 1),
+                                    "_reduction_ratio": abs(change_pct) / 100  # per càlculs
                                 }
-                                # Càlcul per lluminària si tenim el mapa
                                 if n_llun > 0:
                                     w_per_point = (abs(s['change_kw']) * 1000) / n_llun
-                                    row_s["Estalvi/Punt (W)"] = f"{w_per_point:.1f} W"
+                                    row_s["W/Punt estalviat"] = round(w_per_point, 1)
                                 else:
-                                    row_s["Estalvi/Punt (W)"] = "N/A"
-                                
+                                    row_s["W/Punt estalviat"] = None
+
                                 historical_shifts.append(row_s)
 
-                        # Render Resultats
-                        col_r1, col_r2 = st.columns(2)
-                        
-                        with col_r1:
-                            st.write("#### 🌙 Regulació de Fluxe Detectada")
-                            if regulation_results:
-                                st.table(pd.DataFrame(regulation_results))
-                            else:
-                                st.info("No s'han detectat patrons de regulació significatius.")
+                        # Guardar a session_state
+                        st.session_state.lighting_regulation = regulation_results
+                        st.session_state.lighting_shifts = historical_shifts
+                        st.session_state.lighting_consumption_2024 = consumption_2024
+                        st.session_state.lighting_analysis_done = True
 
-                        with col_r2:
-                            st.write("#### 🎯 Eficiència per Punt de Llum")
-                            # Show summary of points per CUPS for transparency
-                            llum_summary = []
-                            for c_name in lighting_selected:
-                                cid = rev_map.get(c_name, c_name)
-                                if cid in llum_map:
-                                    llum_summary.append({"CUPS": c_name, "Punts de Llum": int(llum_map[cid])})
-                            if llum_summary:
-                                st.dataframe(pd.DataFrame(llum_summary), hide_index=True)
+                # --- MOSTRAR RESULTATS (si s'han calculat) ---
+                if st.session_state.lighting_analysis_done:
+                    regulation_results = st.session_state.lighting_regulation
+                    historical_shifts = st.session_state.lighting_shifts
+                    consumption_2024 = st.session_state.lighting_consumption_2024
 
-                        st.write("#### 📈 Canvis Històrics de Potència (Reformes / LED)")
-                        if historical_shifts:
-                            df_h = pd.DataFrame(historical_shifts)
-                            st.dataframe(df_h.sort_values(by="Data", ascending=False), use_container_width=True, hide_index=True)
+                    col_r1, col_r2 = st.columns(2)
+
+                    with col_r1:
+                        st.write("#### 🌙 Regulació de Fluxe Detectada")
+                        if regulation_results:
+                            st.table(pd.DataFrame(regulation_results))
                         else:
-                            st.info("No s'han detectat canvis permanents de potència (>15%) en l'històric.")
+                            st.info("No s'han detectat patrons de regulació significatius.")
 
+                    with col_r2:
+                        st.write("#### 🎯 Punts de Llum per CUPS")
+                        import json as _json2
+                        _json_path2 = Path(__file__).parent / "src" / "data" / "lighting_inventory.json"
+                        try:
+                            with open(_json_path2, encoding='utf-8') as _fj:
+                                _inv = _json2.load(_fj)
+                            _llum_map2 = {item['CUPS']: item['LLUNINARIES TOTALS'] for item in _inv}
+                        except:
+                            _llum_map2 = {}
+                        _rev_map2 = {v: k for k, v in CUPS_MAPPING.items()}
+                        llum_summary = []
+                        for c_name in lighting_selected:
+                            cid = _rev_map2.get(c_name, c_name)
+                            if cid in _llum_map2:
+                                kwh24 = consumption_2024.get(c_name, 0)
+                                llum_summary.append({
+                                    "CUPS": c_name,
+                                    "Punts de Llum": int(_llum_map2[cid]),
+                                    "kWh 2024": f"{kwh24:,.0f}"
+                                })
+                        if llum_summary:
+                            st.dataframe(pd.DataFrame(llum_summary), hide_index=True)
 
+                    st.write("#### 📈 Canvis Històrics de Potència (Reformes LED)")
+                    if historical_shifts:
+                        # Mostrar taula sense la columna interna _reduction_ratio
+                        df_h = pd.DataFrame(historical_shifts)
+                        display_cols = [c for c in df_h.columns if not c.startswith('_')]
+                        st.dataframe(df_h[display_cols].sort_values(by="Data", ascending=False),
+                                     use_container_width=True, hide_index=True)
+                    else:
+                        st.info("No s'han detectat canvis permanents de potència (>15%) en l'històric.")
+
+                    # --- PROJECCIÓ 2026 ---
+                    st.markdown("---")
+                    st.subheader("📊 Projecció de Consum 2026 per Millora LED")
+
+                    if historical_shifts:
+                        df_shifts = pd.DataFrame(historical_shifts)
+                        # CUPS únics amb canvis detectats
+                        cups_with_shifts = df_shifts['CUPS'].unique().tolist()
+
+                        st.markdown(
+                            "Selecciona els CUPS que han realitzat una **millora LED** i es vol fer la projecció 2026. "
+                            "S'aplicarà la reducció de potència detectada sobre el consum real de 2024."
+                        )
+
+                        selected_led_cups = st.multiselect(
+                            "CUPS amb millora LED confirmada:",
+                            options=cups_with_shifts,
+                            default=cups_with_shifts,
+                            key="led_projection_cups"
+                        )
+
+                        # Preu energia (editable)
+                        preu_kwh = st.number_input(
+                            "Preu energia (€/kWh) per càlcul d'estalvi econòmic:",
+                            min_value=0.01, max_value=1.00, value=0.15, step=0.01, format="%.3f"
+                        )
+
+                        if selected_led_cups:
+                            projection_rows = []
+
+                            for cup_name in selected_led_cups:
+                                cup_shifts = df_shifts[df_shifts['CUPS'] == cup_name]
+                                if cup_shifts.empty: continue
+
+                                # Agafar la reducció màxima detectada (la més significativa)
+                                max_reduction = cup_shifts['_reduction_ratio'].max()
+                                kwh_2024 = consumption_2024.get(cup_name, 0)
+
+                                if kwh_2024 == 0: continue
+
+                                kwh_2026_proj = kwh_2024 * (1 - max_reduction)
+                                kwh_estalvi = kwh_2024 - kwh_2026_proj
+                                eur_estalvi = kwh_estalvi * preu_kwh
+
+                                projection_rows.append({
+                                    "CUPS / Zona": cup_name,
+                                    "kWh real 2024": round(kwh_2024, 0),
+                                    "Reducció LED (%)": f"{max_reduction*100:.1f}%",
+                                    "Projecció kWh 2026": round(kwh_2026_proj, 0),
+                                    "Estalvi kWh": round(kwh_estalvi, 0),
+                                    f"Estalvi € ({preu_kwh:.3f} €/kWh)": round(eur_estalvi, 2)
+                                })
+
+                            if projection_rows:
+                                df_proj = pd.DataFrame(projection_rows)
+
+                                # Totals
+                                total_kwh_2024 = df_proj["kWh real 2024"].sum()
+                                total_kwh_2026 = df_proj["Projecció kWh 2026"].sum()
+                                total_estalvi_kwh = df_proj["Estalvi kWh"].sum()
+                                total_estalvi_eur = df_proj[f"Estalvi € ({preu_kwh:.3f} €/kWh)"].sum()
+
+                                st.dataframe(df_proj, use_container_width=True, hide_index=True)
+
+                                # KPIs resum
+                                k1, k2, k3, k4 = st.columns(4)
+                                k1.metric("Total kWh 2024", f"{total_kwh_2024:,.0f} kWh")
+                                k2.metric("Projecció 2026", f"{total_kwh_2026:,.0f} kWh",
+                                          delta=f"-{total_estalvi_kwh:,.0f} kWh", delta_color="inverse")
+                                k3.metric("Estalvi Total", f"{total_estalvi_kwh:,.0f} kWh")
+                                k4.metric("Estalvi Econòmic", f"{total_estalvi_eur:,.0f} €")
+
+                                # Gràfic de barres comparatiu
+                                fig_proj = go.Figure()
+                                fig_proj.add_trace(go.Bar(
+                                    name="kWh real 2024",
+                                    x=df_proj["CUPS / Zona"],
+                                    y=df_proj["kWh real 2024"],
+                                    marker_color='#636EFA'
+                                ))
+                                fig_proj.add_trace(go.Bar(
+                                    name="Projecció kWh 2026",
+                                    x=df_proj["CUPS / Zona"],
+                                    y=df_proj["Projecció kWh 2026"],
+                                    marker_color='#00CC96'
+                                ))
+                                fig_proj.update_layout(
+                                    title="Comparativa Consum Real 2024 vs Projecció 2026 (post-LED)",
+                                    barmode='group',
+                                    xaxis_title="CUPS / Zona",
+                                    yaxis_title="kWh",
+                                    legend=dict(orientation="h", yanchor="bottom", y=1.02)
+                                )
+                                st.plotly_chart(fig_proj, use_container_width=True)
+                    else:
+                        st.info("Primer executeu l'anàlisi per detectar canvis de potència que permetin la projecció.")
 
         # --- Tab 4: AI Advisor ---
         with tab4:
