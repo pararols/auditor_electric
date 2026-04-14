@@ -204,3 +204,48 @@ def sync_csv_to_db(df, mode="merge"):
             st.error(f"Error en el bloc {k}: {e}")
             
     status_text.success("Dades sincronitzades correctament! 🚀")
+
+def get_inventory_fixtures():
+    """Recupera el llistat de lluminàries des de Supabase (taula inventory_fixtures)."""
+    supabase = init_supabase()
+    if not supabase: return pd.DataFrame()
+    
+    try:
+        res = supabase.table("inventory_fixtures").select("*").execute()
+        if res.data:
+            df = pd.DataFrame(res.data)
+            # Normalitzem noms de columnes per compatibilitat amb l'app
+            df = df.rename(columns={
+                'cups': 'CUPS',
+                'location': 'LOCALITZACIO',
+                'fixture_count': 'LLUNINARIES TOTALS'
+            })
+            return df
+    except Exception as e:
+        st.error(f"Error recuperant inventari de Supabase: {e}")
+    return pd.DataFrame()
+
+def sync_fixtures_to_db(df):
+    """Sincronitza el DataFrame de lluminàries (des de l'Excel) a Supabase."""
+    supabase = init_supabase()
+    if not supabase: return False
+    
+    # Preparar dades per Supabase
+    data_to_sync = []
+    for _, row in df.iterrows():
+        if pd.isna(row['CUPS']): continue
+        data_to_sync.append({
+            "cups": str(row['CUPS']).strip(),
+            "location": str(row['LOCALITZACIO']),
+            "fixture_count": int(row['LLUNINARIES TOTALS'])
+        })
+    
+    if not data_to_sync: return False
+    
+    try:
+        # Upsert: actualitza si el CUPS ja existeix
+        supabase.table("inventory_fixtures").upsert(data_to_sync, on_conflict='cups').execute()
+        return True
+    except Exception as e:
+        st.error(f"Error sincronitzant inventari a Supabase: {e}")
+        return False
