@@ -107,6 +107,10 @@ def load_from_supabase_db(start_date=None, end_date=None):
         data_df.index.name = 'Datetime'
         return data_df
         
+    except Exception as e:
+        st.error(f"Error carregant de Supabase: {e}")
+        return None
+
 @st.cache_data(ttl=3600)
 def get_last_complete_day_all_cups(target_cups_ids=None):
     """
