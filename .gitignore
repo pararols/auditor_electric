@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 .venv/
 data/
+!src/data/lighting_inventory.json
 *.xlsx
 
 # User excluded directories
