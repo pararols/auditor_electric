@@ -559,15 +559,28 @@ def render_cle_optimizer():
         # --- 2. TAULA DETALLADA DE PUNTS DE SUBMINISTRAMENT ---
         st.markdown("### 📋 Resultats Detallats per Equipament")
         
+        if not detailed_results:
+            st.warning("No s'han generat resultats.")
+            return
+
         df_res = pd.DataFrame(detailed_results)
-        df_res = df_res.drop(columns=['Mensual'])
+        if 'Mensual' in df_res.columns:
+            df_res = df_res.drop(columns=['Mensual'])
         
-        # Add Total Row
-        totals = df_res.sum(numeric_only=True)
-        totals['CUPS'] = 'TOTAL AGREGAT'
-        totals['Nom'] = ''
-        totals['Cobertura (%)'] = (totals['Autoconsum Total (kWh)'] / totals['Consum Anual (kWh)']) * 100 if totals['Consum Anual (kWh)'] else 0
-        df_res = pd.concat([df_res, pd.DataFrame([totals])], ignore_index=True)
+        # Càlcul de totals de forma robusta
+        numeric_cols = df_res.select_dtypes(include=[np.number]).columns
+        # Creem un diccionari per a la fila de totals
+        total_data = {col: df_res[col].sum() for col in numeric_cols}
+        total_data['CUPS'] = 'TOTAL AGREGAT'
+        total_data['Nom'] = ''
+        
+        # Recalcular cobertura global rectament
+        c_tot = total_data.get('Consum Anual (kWh)', 0)
+        a_tot = total_data.get('Autoconsum Total (kWh)', 0)
+        total_data['Cobertura (%)'] = (a_tot / c_tot * 100) if c_tot > 0 else 0
+        
+        # Afegir fila de totals al final
+        df_res = pd.concat([df_res, pd.DataFrame([total_data])], ignore_index=True)
         
         # CSV Export Preparation (Before string formatting)
         csv_data = df_res.to_csv(index=False, sep=';', decimal=',')
