@@ -419,6 +419,12 @@ def render_cle_optimizer():
         * Totes les xifres econòmiques estan finalment gravades amb Impost Elèctric (5.11%) i IVA (21%).
     """)
     
+    # --- GESTIÓ D'ESTAT (SESSION STATE) ---
+    if 'cle_results' not in st.session_state:
+        st.session_state.cle_results = None
+    if 'cle_end_date' not in st.session_state:
+        st.session_state.cle_end_date = None
+    
     st.markdown("#### Paràmetres d'Anàlisi i Opcions Legals")
     
     # 1. Trobar data límit per defecte
@@ -428,9 +434,9 @@ def render_cle_optimizer():
     # 2. UI Selector de Període
     col0, col1, col2, col3, col4 = st.columns([2, 1, 1, 1, 1.5])
     with col0:
-        end_date = st.date_input("Analitzar període de 1 any fins a:", value=default_end_date or pd.Timestamp.now().date())
-        start_date = end_date - pd.Timedelta(days=364)
-        st.info(f"Rang d'anàlisi: {start_date.strftime('%d/%m/%Y')} - {end_date.strftime('%d/%m/%Y')}")
+        current_end_date = st.date_input("Analitzar període de 1 any fins a:", value=default_end_date or pd.Timestamp.now().date())
+        start_date = current_end_date - pd.Timedelta(days=364)
+        st.info(f"Rang d'anàlisi: {start_date.strftime('%d/%m/%Y')} - {current_end_date.strftime('%d/%m/%Y')}")
 
     # Nova sub-opció ben visible a dalt (Poda de <0.5 kWp)
     filter_micro = col4.checkbox("Excloure < 0.5 kWp", value=True, help="Simplifica la gestió administrativa municipal")
@@ -461,7 +467,7 @@ def render_cle_optimizer():
         """, height=0)
 
     if run_btn:
-        df_consum = fetch_and_prep_consumption(start_date, end_date)
+        df_consum = fetch_and_prep_consumption(start_date, current_end_date)
         if df_consum is None or df_consum.empty:
             st.error(f"No s'han trobat dades de consum suficients per al període seleccionat.")
             return
@@ -469,10 +475,14 @@ def render_cle_optimizer():
         prices = calculate_tariffs(df_consum.index, p1, p2, p3)
         
         # Corre l'optimització amb el paràmetre de tall de kWp
-        detailed_results = run_optimization(df_consum, prices, p_exc, min_kwp_threshold=min_kwp_val)
-        
-        # --- PROCESSAMENT RESULTATS ---
+        st.session_state.cle_results = run_optimization(df_consum, prices, p_exc, min_kwp_threshold=min_kwp_val)
+        st.session_state.cle_end_date = current_end_date
         st.success("Optimització finalitzada amb èxit!")
+
+    # --- RENDERITZAT DE RESULTATS (DES DE L'ESTAT) ---
+    if st.session_state.cle_results is not None:
+        detailed_results = st.session_state.cle_results
+        saved_end_date = st.session_state.cle_end_date
         
         # --- 1. RESUM EXECUTIU ---
         st.markdown("### 📊 Resum Executiu Global")
@@ -564,7 +574,7 @@ def render_cle_optimizer():
         st.download_button(
             label="📥 Descarregar Resultats (CSV)",
             data=csv_data.encode('utf-8-sig'),
-            file_name=f'resultats_cle_optimitzats_{end_date.year}.csv',
+            file_name=f'resultats_cle_optimitzats_{saved_end_date.year}.csv',
             mime='text/csv'
         )
         
