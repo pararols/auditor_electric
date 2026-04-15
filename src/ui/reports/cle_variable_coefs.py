@@ -301,6 +301,15 @@ def evaluate_variable_coefs(
     return results_by_cups, total_cost_nosolar - total_cost_solar
 
 
+def _get_val(d: dict, key_fragment: str, default: float = 0.0) -> float:
+    """Cerca robusta: retorna el valor de la primera clau que contingui
+    key_fragment (insensible a variacions d'encoding del signe €)."""
+    for k, v in d.items():
+        if key_fragment in k:
+            return float(v)
+    return default
+
+
 def render_cle_variable_optimizer():
     """
     Renderitza la pestanya de coeficients variables dins del CLE Pavelló.
@@ -396,8 +405,8 @@ def render_cle_variable_optimizer():
     # --- Comparativa vs. coeficients fixes (si disponible) ---
     if st.session_state.get('cle_results'):
         fixed_results: list = st.session_state['cle_results']
-        tot_auto_fix = sum(r['Autoconsum Total (kWh)'] for r in fixed_results)
-        tot_sav_fix = sum(r['Estalvi Anual (€)'] for r in fixed_results)
+        tot_auto_fix = sum(_get_val(r, 'Autoconsum Total') for r in fixed_results)
+        tot_sav_fix = sum(_get_val(r, 'Estalvi Anual') for r in fixed_results)
         d_auto_total = tot_auto - tot_auto_fix
         d_sav_total = total_savings_var - tot_sav_fix
 
@@ -420,8 +429,8 @@ def render_cle_variable_optimizer():
         for r_v in results_var:
             cups = r_v['CUPS']
             r_f = fixed_by_cups.get(cups, {})
-            d_auto = r_v['Autoconsum Total (kWh)'] - r_f.get('Autoconsum Total (kWh)', 0)
-            d_sav = r_v['Estalvi Anual (€)'] - r_f.get('Estalvi Anual (€)', 0)
+            d_auto = r_v['Autoconsum Total (kWh)'] - _get_val(r_f, 'Autoconsum Total')
+            d_sav = _get_val(r_v, 'Estalvi Anual') - _get_val(r_f, 'Estalvi Anual')
             comp_rows.append({
                 'Nom': r_v['Nom'],
                 'Coef Fix': f"{r_f.get('Coeficient Pavelló', 0):.6f}",
