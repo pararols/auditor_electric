@@ -236,7 +236,7 @@ def evaluate_coefficients(coefs, cups_names, df_consum, gen_pavello, gen_salanov
                 'Autoconsum PAV': np.sum(auto_pav_mask),
                 'Autoconsum': np.sum(autoconsum[mask]),
                 'Import Net': np.sum(net_import[mask]),
-                'Estalvi â‚¬ (Brut)': c_nos_taxes - c_sol_taxes
+                'Estalvi € (Brut)': c_nos_taxes - c_sol_taxes
             })
             
         total_auto_sn = sum([x['Autoconsum SN'] for x in mensual_stats])
@@ -257,9 +257,9 @@ def evaluate_coefficients(coefs, cups_names, df_consum, gen_pavello, gen_salanov
             'Cobertura (%)': (np.sum(autoconsum) / np.sum(consum)) * 100 if np.sum(consum)>0 else 0,
             'Excedents Compensats (kWh)': excedents_compensats_qty,
             'Excedents LlenÃ§ats a la xarxa (kWh)': excedents_abocats_qty,
-            'Estalvi Autoconsum (â‚¬)': estalvi_auto_cups,
-            'Estalvi CompensaciÃ³ (â‚¬)': estalvi_comp_cups,
-            'Estalvi Anual (â‚¬)': cost_nosolar_cups - cost_solar_cups,
+            'Estalvi Autoconsum (€)': estalvi_auto_cups,
+            'Estalvi CompensaciÃ³ (€)': estalvi_comp_cups,
+            'Estalvi Anual (€)': cost_nosolar_cups - cost_solar_cups,
             'Mensual': mensual_stats
         })
         
@@ -312,7 +312,7 @@ def run_optimization(df_consum, prices, excedent_price, min_kwp_threshold=0.0):
         t_exc_lost = sum(d['Excedents LlenÃ§ats a la xarxa (kWh)'] for d in details)
         
         pl_it.metric("IteraciÃ³", f"#{iteration_count[0]}")
-        pl_sav.metric("Estalvi Anual", f"{t_sav:,.0f} â‚¬".replace(',', '.'))
+        pl_sav.metric("Estalvi Anual", f"{t_sav:,.0f} €".replace(',', '.'))
         pl_aut.metric("Autoconsum", f"{t_aut:,.0f} kWh".replace(',', '.'))
         pl_exc_comp.metric("Excedent Compensat", f"{t_exc_comp:,.0f} kWh".replace(',', '.'))
         pl_exc_lost.metric("Excedent No Compensat", f"{t_exc_lost:,.0f} kWh".replace(',', '.'))
@@ -443,13 +443,13 @@ def render_cle_optimizer():
     st.write("") # Separador
     
     # UI Constants
-    p1 = col1.number_input("Preu P1 (â‚¬)", value=0.22, format="%.3f")
-    p2 = col2.number_input("Preu P2 (â‚¬)", value=0.147, format="%.3f")
-    p3 = col3.number_input("Preu P3 (â‚¬)", value=0.11, format="%.3f")
-    # p_exc = col4.number_input("Comp. (â‚¬)", value=0.07, format="%.3f") # Removed col4 to refactor
+    p1 = col1.number_input("Preu P1 (€)", value=0.22, format="%.3f")
+    p2 = col2.number_input("Preu P2 (€)", value=0.147, format="%.3f")
+    p3 = col3.number_input("Preu P3 (€)", value=0.11, format="%.3f")
+    # p_exc = col4.number_input("Comp. (€)", value=0.07, format="%.3f") # Removed col4 to refactor
     
     col_a, col_b = st.columns([1, 4])
-    p_exc = col_a.number_input("CompensaciÃ³ Excedents (â‚¬)", value=0.07, format="%.3f")
+    p_exc = col_a.number_input("CompensaciÃ³ Excedents (€)", value=0.07, format="%.3f")
 
     st.write("") # Separador
     
@@ -507,9 +507,9 @@ def render_cle_optimizer():
             tot_exc_lost = sum([r['Excedents LlenÃ§ats a la xarxa (kWh)'] for r in detailed_results])
             tot_gen = tot_auto + tot_exc_comp + tot_exc_lost
 
-            tot_est_auto = sum([r['Estalvi Autoconsum (â‚¬)'] for r in detailed_results])
-            tot_est_comp = sum([r['Estalvi CompensaciÃ³ (â‚¬)'] for r in detailed_results])
-            tot_est_global = sum([r['Estalvi Anual (â‚¬)'] for r in detailed_results])
+            tot_est_auto = sum([r['Estalvi Autoconsum (€)'] for r in detailed_results])
+            tot_est_comp = sum([r['Estalvi CompensaciÃ³ (€)'] for r in detailed_results])
+            tot_est_global = sum([r['Estalvi Anual (€)'] for r in detailed_results])
 
             pct_cobertura = (tot_auto / tot_consum * 100) if tot_consum > 0 else 0
             pct_aprofitament = ((tot_auto + tot_exc_comp) / tot_gen * 100) if tot_gen > 0 else 0
@@ -517,7 +517,7 @@ def render_cle_optimizer():
             st.write("")
             col_k1, col_k2, col_k3, col_k4 = st.columns(4)
             with col_k1:
-                st.metric("ðŸ’¶ Estalvi EconÃ²mic Total", f"{tot_est_global:,.0f} â‚¬".replace(',', '.'))
+                st.metric("ðŸ’¶ Estalvi EconÃ²mic Total", f"{tot_est_global:,.0f} €".replace(',', '.'))
             with col_k2:
                 st.metric("âš¡ Energia Generada (Quota)", f"{tot_gen:,.0f} kWh".replace(',', '.'))
             with col_k3:
@@ -537,10 +537,10 @@ def render_cle_optimizer():
                 color_discrete_sequence=["#2ecc71", "#f1c40f"]
             )
             fig_donut1.update_scenes(aspectratio=dict(x=1, y=1, z=1))
-            fig_donut1.update_layout(title_text="Desglossament EconÃ²mic (â‚¬)", title_x=0.5,
+            fig_donut1.update_layout(title_text="Desglossament EconÃ²mic (€)", title_x=0.5,
                                      margin=dict(t=40, b=10, l=10, r=10), showlegend=False)
             fig_donut1.update_traces(textposition='inside', textinfo='percent+label',
-                                     hovertemplate="%{label}<br>%{value:,.0f} â‚¬<extra></extra>")
+                                     hovertemplate="%{label}<br>%{value:,.0f} €<extra></extra>")
             col_g1.plotly_chart(fig_donut1, use_container_width=True)
 
             fig_donut2 = px.pie(
@@ -613,12 +613,12 @@ def render_cle_optimizer():
                 lambda x: f"{x:,.0f} kWh".replace(',', '.'))
             df_display['ProducciÃ³ FV'] = df_display['ProducciÃ³ FV (kWh)'].apply(
                 lambda x: f"{x:,.0f} kWh".replace(',', '.'))
-            df_display['Estalvi Autoconsum (â‚¬)'] = df_display['Estalvi Autoconsum (â‚¬)'].apply(
-                lambda x: f"{x:,.2f} â‚¬".replace(',', '.'))
-            df_display['Estalvi CompensaciÃ³ (â‚¬)'] = df_display['Estalvi CompensaciÃ³ (â‚¬)'].apply(
-                lambda x: f"{x:,.2f} â‚¬".replace(',', '.'))
-            df_display['Estalvi Anual (â‚¬)'] = df_display['Estalvi Anual (â‚¬)'].apply(
-                lambda x: f"{x:,.2f} â‚¬".replace(',', '.'))
+            df_display['Estalvi Autoconsum (€)'] = df_display['Estalvi Autoconsum (€)'].apply(
+                lambda x: f"{x:,.2f} €".replace(',', '.'))
+            df_display['Estalvi CompensaciÃ³ (€)'] = df_display['Estalvi CompensaciÃ³ (€)'].apply(
+                lambda x: f"{x:,.2f} €".replace(',', '.'))
+            df_display['Estalvi Anual (€)'] = df_display['Estalvi Anual (€)'].apply(
+                lambda x: f"{x:,.2f} €".replace(',', '.'))
             df_display['Cobertura (%)'] = df_display['Cobertura (%)'].apply(lambda x: f"{x:.1f} %")
             df_display['Autoconsum (Sala Nova)'] = df_display['Autoconsum SN (kWh)'].apply(
                 lambda x: f"{x:,.0f} kWh".replace(',', '.'))
@@ -638,7 +638,7 @@ def render_cle_optimizer():
                 'Consum Anual (kWh)', 'ProducciÃ³ FV',
                 'Autoconsum (Sala Nova)', 'Autoconsum (PavellÃ³)', 'Autoconsum Total', 'Cobertura (%)',
                 'Excedents Compensats', 'Excedents LlenÃ§ats',
-                'Estalvi Autoconsum (â‚¬)', 'Estalvi CompensaciÃ³ (â‚¬)', 'Estalvi Anual (â‚¬)'
+                'Estalvi Autoconsum (€)', 'Estalvi CompensaciÃ³ (€)', 'Estalvi Anual (€)'
             ]
             df_display = df_display[cols_order]
             st.dataframe(df_display, use_container_width=True)
@@ -660,7 +660,7 @@ def render_cle_optimizer():
                                   for r in detailed_results])
                 m_import = sum([list(filter(lambda x: x['Mes'] == m, r['Mensual']))[0]['Import Net']
                                 for r in detailed_results])
-                m_estalvi = sum([list(filter(lambda x: x['Mes'] == m, r['Mensual']))[0]['Estalvi â‚¬ (Brut)']
+                m_estalvi = sum([list(filter(lambda x: x['Mes'] == m, r['Mensual']))[0]['Estalvi € (Brut)']
                                  for r in detailed_results])
 
                 monthly_aggs.append({
@@ -671,7 +671,7 @@ def render_cle_optimizer():
                     'GeneraciÃ³ PAV (kWh)': m_gen_pav,
                     'Autoconsum SN (kWh)': m_auto_sn,
                     'Autoconsum PAV (kWh)': m_auto_pav,
-                    'Estalvi Efectiu Mensual (â‚¬)': m_estalvi,
+                    'Estalvi Efectiu Mensual (€)': m_estalvi,
                 })
 
             df_months = pd.DataFrame(monthly_aggs)
@@ -707,7 +707,7 @@ def render_cle_optimizer():
                                xaxis_title='Mes', yaxis_title='kWh')
             st.plotly_chart(fig3, use_container_width=True)
 
-            fig2 = px.line(df_months, x='Mes', y='Estalvi Efectiu Mensual (â‚¬)', markers=True,
+            fig2 = px.line(df_months, x='Mes', y='Estalvi Efectiu Mensual (€)', markers=True,
                            title='Corba EconÃ²mica: Estalvi Efectiu (Taxes i LÃ­mits RD 244 InclÃ²s)')
             fig2.update_traces(line_color='#d32f2f', marker=dict(size=8))
             st.plotly_chart(fig2, use_container_width=True)
