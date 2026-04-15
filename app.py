@@ -850,7 +850,7 @@ def main():
                             st.info("No s'han detectat patrons de regulació significatius.")
 
                     with col_r2:
-                        st.write("#### 🎯 Punts de Llum per CUPS")
+                        st.write("#### 🎯 Potència Actual per Lluminària")
                         import json as _json2
                         _json_path2 = Path(__file__).parent / "src" / "data" / "lighting_inventory.json"
                         try:
@@ -860,18 +860,45 @@ def main():
                         except:
                             _llum_map2 = {}
                         _rev_map2 = {v: k for k, v in CUPS_MAPPING.items()}
-                        llum_summary = []
+
+                        llum_power_rows = []
                         for c_name in lighting_selected:
                             cid = _rev_map2.get(c_name, c_name)
-                            if cid in _llum_map2:
-                                kwh24 = consumption_2024.get(c_name, 0)
-                                llum_summary.append({
-                                    "CUPS": c_name,
-                                    "Punts de Llum": int(_llum_map2[cid]),
-                                    "kWh 2024": f"{kwh24:,.0f}"
-                                })
-                        if llum_summary:
-                            st.dataframe(pd.DataFrame(llum_summary), hide_index=True)
+                            n_pts = int(_llum_map2.get(cid, 0))
+
+                            # Potència nocturna de l'últim mes amb dades
+                            p_inst_kw = 0.0
+                            w_per_pt = None
+                            if c_name in df.columns.get_level_values(0):
+                                try:
+                                    _ae_cols = [c for c in df[c_name].columns
+                                                if 'AE' in c and 'kWh' in c and 'AUTOCONS' not in c]
+                                    if _ae_cols:
+                                        _s = df[c_name][_ae_cols[0]].dropna()
+                                        # Últim mes complet amb dades
+                                        _last_month = _s.index.max().to_period('M')
+                                        _s_last = _s[_s.index.to_period('M') == _last_month]
+                                        # Potència nocturna: P95 de les hores 0-5h (plató instal·lat)
+                                        _night = _s_last[(_s_last.index.hour >= 0) & (_s_last.index.hour <= 5)]
+                                        if not _night.empty:
+                                            # Consum kWh/15min → potència kW = valor * 4
+                                            p_inst_kw = float(_night.quantile(0.95)) * 4
+                                            if n_pts > 0:
+                                                w_per_pt = (p_inst_kw * 1000) / n_pts
+                                except:
+                                    pass
+
+                            row = {
+                                "CUPS / Zona": c_name,
+                                "Punts de Llum": n_pts if n_pts > 0 else "N/A",
+                                "P. Inst. (kW)": f"{p_inst_kw:.2f}" if p_inst_kw > 0 else "—",
+                                "W/Lluminària": f"{w_per_pt:.0f} W" if w_per_pt else "—",
+                                "kWh 2024": f"{consumption_2024.get(c_name, 0):,.0f}"
+                            }
+                            llum_power_rows.append(row)
+
+                        if llum_power_rows:
+                            st.dataframe(pd.DataFrame(llum_power_rows), hide_index=True, use_container_width=True)
 
                     st.write("#### 📈 Canvis Històrics de Potència (Reformes LED)")
                     if historical_shifts:
@@ -882,6 +909,7 @@ def main():
                                      use_container_width=True, hide_index=True)
                     else:
                         st.info("No s'han detectat canvis permanents de potència (>15%) en l'històric.")
+
 
                     # --- PROJECCIÓ 2026 ---
                     st.markdown("---")
