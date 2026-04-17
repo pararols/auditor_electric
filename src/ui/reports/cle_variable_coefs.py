@@ -3,7 +3,7 @@ CLE Pavelló — Optimitzador de Coeficients Variables Horaris
 ============================================================
 Calcula una matriu de coeficients (12 mesos × 24 hores) per a cada CUPS
 municipal, repartint la quota del Pavelló proporcionalment al consum real
-de cada franja horària. En hores de sol d'estiu (Jun-Ago, 08h-20h) redistribueix
+de cada franja horària. En nits d'estiu (Jun-Ago, 21h-07h) redistribueix
 quota cap als CUPS d'enllumeament per evitar excedents no compensables.
 
 Els coeficients de la Sala Nova (COMMUNITY_QUOTAS) no es toquen mai.
@@ -25,7 +25,7 @@ MESOS_CAT = ['Gen', 'Feb', 'Mar', 'Abr', 'Mai', 'Jun',
              'Jul', 'Ago', 'Set', 'Oct', 'Nov', 'Des']
 
 SUMMER_MONTHS = {6, 7, 8}
-DAY_HOURS = set(range(8, 21)) # de 08:00 a 20:00
+DAY_HOURS = set(range(8, 21))  # 08h to 20h
 
 
 def _is_lighting(cups_id: str) -> bool:
@@ -41,7 +41,7 @@ def _is_lighting(cups_id: str) -> bool:
 
 def compute_variable_coef_matrix(
     df_consum: pd.DataFrame,
-    summer_day_boost: float = 0.20,
+    summer_day_boost: float = 0.40,
     min_kwp_threshold: float = 0.5,
 ) -> dict:
     """
@@ -52,8 +52,8 @@ def compute_variable_coef_matrix(
     df_consum : DataFrame
         Consum horari per CUPS (columnes = cups_ids, índex DatetimeIndex).
     summer_day_boost : float
-        Fracció (0–0.5) de la quota dels edificis que es redistribueix
-        als CUPS d'enllumeament en hores de sol d'estiu.
+        Fracció (0–0.8) de la quota dels edificis que es redistribueix
+        als CUPS d'enllumeament en hores de sol d'estiu per compensar.
     min_kwp_threshold : float
         CUPS amb assignació mitjana anual < X kWp s'exclouen (igual que SLSQP).
 
@@ -93,17 +93,23 @@ def compute_variable_coef_matrix(
                 raw_coef[:, m_idx, h] = TARGET_RATIO / N
 
     # --- Pas 3: boost diürn d'estiu cap als enllumeaments ---
+    # Com que de dia no hi ha consum d'enllumenat, es reparteix proporcional al seu consum total del mes
     if summer_day_boost > 0 and lighting_mask.any() and building_mask.any():
+        # Pre-calcular el consum total mensual per a assignar pesos
+        monthly_cons = mean_cons.sum(axis=2)  # Forma: (N, 12)
+        
         for m_idx in range(12):
             month_num = m_idx + 1
             if month_num not in SUMMER_MONTHS:
                 continue
-            
-            # Repartiment ponderat basejat en el consum total DEL MES sencer 
-            # de cada lluminària per evitar el 0 de consum per hora en ple dia.
-            light_monthly_d = mean_cons[lighting_mask, m_idx, :].sum(axis=1)
-            light_total = light_monthly_d.sum()
-
+                
+            light_monthly = monthly_cons[lighting_mask, m_idx]
+            light_monthly_tot = light_monthly.sum()
+            if light_monthly_tot > 0:
+                light_weights = light_monthly / light_monthly_tot
+            else:
+                light_weights = np.ones(lighting_mask.sum()) / lighting_mask.sum()
+                
             for h in range(24):
                 if h not in DAY_HOURS:
                     continue
@@ -112,18 +118,17 @@ def compute_variable_coef_matrix(
                 bld_coef_sum = raw_coef[building_mask, m_idx, h].sum()
                 boost = bld_coef_sum * summer_day_boost
 
-                # Repartir boost als enllumeaments proporcional al seu consum mensual
-                if light_total > 0:
-                    raw_coef[lighting_mask, m_idx, h] += boost * (light_monthly_d / light_total)
+                # Repartir boost als enllumeaments segons les seves hores nocturnes (pes mensual)
+                raw_coef[lighting_mask, m_idx, h] += boost * light_weights
 
-                    # Restar proporcionalment dels edificis
-                    bld_d = demands[building_mask]
-                    bld_total = bld_d.sum()
-                    if bld_total > 0:
-                        raw_coef[building_mask, m_idx, h] -= boost * (bld_d / bld_total)
-                        raw_coef[building_mask, m_idx, h] = np.maximum(
-                            0.0, raw_coef[building_mask, m_idx, h]
-                        )
+                # Restar proporcionalment dels edificis
+                bld_d = demands[building_mask]
+                bld_total = bld_d.sum()
+                if bld_total > 0:
+                    raw_coef[building_mask, m_idx, h] -= boost * (bld_d / bld_total)
+                    raw_coef[building_mask, m_idx, h] = np.maximum(
+                        0.0, raw_coef[building_mask, m_idx, h]
+                    )
 
                 # Re-normalitzar per garantir la suma exacta
                 col_sum = raw_coef[:, m_idx, h].sum()
@@ -325,10 +330,9 @@ def render_cle_variable_optimizer():
     st.markdown("### 🔀 Coeficients Variables Horaris")
     st.markdown("""
     Distribueix la quota del Pavelló **proporcionalment al consum real** de cada
-    equipament en cada franja horària. Durant els dies d'estiu (Jun–Ago, 08h–20h)
-    augmenta el pes dels CUPS d'enllumeament per aprofitar la generació solar
-    amb el fi d'acumular saldo de compensació i reduir la costosa despesa nocturna de 
-    l'enllumenat públic, alleugerint els excedents no compensables dels edificis.
+    equipament en cada franja horària. Durant els mesos d'estiu (Jun–Ago), com que
+    el consum dels edificis baixa però tenen generació, es redirigeix part de la
+    seva quota diürna a l'enllumenat públic per evitar excedents no compensables.
 
     > La Sala Nova manté el seu coeficient fix en tot moment.
     """)
@@ -353,12 +357,13 @@ def render_cle_variable_optimizer():
     # --- Controls ---
     boost_pct = st.slider(
         "☀️ Boost diürn estiu (Jun–Ago, 08h–20h) cap a enllumeaments:",
-        min_value=0, max_value=50, value=20, step=5,
+        min_value=0, max_value=80, value=40, step=5,
         format="%d%%",
         help=(
-            "Percentatge de la quota dels edificis que es redistribuirà "
-            "als CUPS d'enllumeament en hores de sol d'estiu (Jun-Ago). "
-            "0% = repartiment purament proporcional al consum estricte horari."
+            "Percentatge de la quota dels edificis que es redirigeix "
+            "als CUPS d'enllumeament durant les hores de sol d'estiu. "
+            "Com que a l'estiu els edificis consumeixen menys en global, "
+            "reduir la seva quota diürna evita excedents no compensables."
         ),
         key="var_boost_slider"
     )
