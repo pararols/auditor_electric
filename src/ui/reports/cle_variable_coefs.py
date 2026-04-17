@@ -300,6 +300,7 @@ def evaluate_variable_coefs(
             'Excedents Llençats a la xarxa (kWh)': excedents_abocats,
             'Estalvi Autoconsum (€)': estalvi_auto_cups,
             'Estalvi Compensació (€)': estalvi_comp_cups,
+            'Cost Anual Sense FV (€)': cost_nosolar_cups,
             'Estalvi Anual (€)': cost_nosolar_cups - cost_solar_cups,
             'Mensual': mensual_stats,
         })
@@ -448,7 +449,18 @@ def render_cle_variable_optimizer():
                 'Δ Autoconsum (kWh)': f"{d_auto:+,.0f}".replace(',', '.'),
                 'Δ Estalvi (€)': f"{d_sav:+,.2f}".replace(',', '.'),
             })
-        st.dataframe(pd.DataFrame(comp_rows), use_container_width=True, hide_index=True)
+        df_comp = pd.DataFrame(comp_rows)
+        st.dataframe(df_comp, use_container_width=True, hide_index=True)
+        
+        import io
+        b_comp = io.BytesIO()
+        df_comp.to_excel(b_comp, index=False)
+        st.download_button(
+            "📥 Descarregar Comparativa Variables vs Fixes (Excel)",
+            data=b_comp.getvalue(),
+            file_name="cle_comparativa_variables_fixes.xlsx",
+            mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
         st.markdown("---")
 
     # --- Heatmaps ---
@@ -580,6 +592,15 @@ def render_cle_variable_optimizer():
     tot_row['Cobertura (%)'] = (tot_a / tot_c * 100) if tot_c > 0 else 0
     df_res = pd.concat([df_res, pd.DataFrame([tot_row])], ignore_index=True)
     st.dataframe(df_res, use_container_width=True, hide_index=True)
+
+    b_res = io.BytesIO()
+    df_res.to_excel(b_res, index=False)
+    st.download_button(
+        "📥 Descarregar Resultats per Equipament (Excel)",
+        data=b_res.getvalue(),
+        file_name="cle_resultats_variables.xlsx",
+        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    )
 
     # --- CSV oficial (matriu de coeficients) ---
     st.markdown("#### 📥 Exportació CSV Official")

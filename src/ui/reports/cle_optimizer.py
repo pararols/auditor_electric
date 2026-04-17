@@ -520,6 +520,8 @@ def evaluate_coefficients(coefs, cups_names, df_consum, gen_pavello, gen_salanov
 
             'Estalvi Compensació (€)': estalvi_comp_cups,
 
+            'Cost Anual Sense FV (€)': cost_nosolar_cups,
+
             'Estalvi Anual (€)': cost_nosolar_cups - cost_solar_cups,
 
             'Mensual': mensual_stats
@@ -814,7 +816,7 @@ def render_cle_optimizer():
 
     
 
-    st.subheader("⚙ï¸ Optimitzador CLE: Assignació Repartiment Pavelló (RD 244/2019)")
+    st.subheader("⚙ï¸  Optimitzador CLE: Assignació Repartiment Pavelló (RD 244/2019)")
 
     st.markdown("""
 
@@ -916,7 +918,7 @@ def render_cle_optimizer():
 
     # Botó d'impressió amb JS
 
-    if col_print.button("🖨ï¸ Imprimir resultats"):
+    if col_print.button("🖨ï¸  Imprimir resultats"):
 
         st.components.v1.html("""
 
@@ -1044,11 +1046,11 @@ def render_cle_optimizer():
 
             with col_k3:
 
-                st.metric("🛡ï¸ Cobertura Autoconsum", f"{pct_cobertura:.1f} %")
+                st.metric("🛡ï¸  Cobertura Autoconsum", f"{pct_cobertura:.1f} %")
 
             with col_k4:
 
-                st.metric("♻ï¸ Aprofitament de Planta", f"{pct_aprofitament:.1f} %",
+                st.metric("♻ï¸  Aprofitament de Planta", f"{pct_aprofitament:.1f} %",
 
                           help="Inclou Autoconsum + Excedents Compensats")
 
@@ -1234,7 +1236,11 @@ def render_cle_optimizer():
 
             df_display['Estalvi Compensació (€)'] = df_display['Estalvi Compensació (€)'].apply(
 
-                lambda x: f"{x:,.2f} €".replace(',', '.'))
+                lambda x: f"{x:,.2f}".replace(',', '.'))
+
+            df_display['Cost Anual Sense FV (€)'] = df_display['Cost Anual Sense FV (€)'].apply(
+
+                lambda x: f"{x:,.2f}".replace(',', '.'))
 
             df_display['Estalvi Anual (€)'] = df_display['Estalvi Anual (€)'].apply(
 
@@ -1278,7 +1284,7 @@ def render_cle_optimizer():
 
                 'Excedents Compensats', 'Excedents Llençats',
 
-                'Estalvi Autoconsum (€)', 'Estalvi Compensació (€)', 'Estalvi Anual (€)'
+                'Estalvi Autoconsum (€)', 'Estalvi Compensació (€)', 'Cost Anual Sense FV (€)', 'Estalvi Anual (€)'
 
             ]
 
