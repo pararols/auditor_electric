@@ -24,6 +24,9 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         if [ -f "shedule_huawei/requirements.txt" ]; then pip install -r shedule_huawei/requirements.txt; fi
+    
+    - name: Upgrade SSL Certificates
+      run: pip install --upgrade certifi
 
     - name: Run Daily Sync
       env:
