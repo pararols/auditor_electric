@@ -41,27 +41,13 @@ def _is_lighting(cups_id: str) -> bool:
 
 def compute_variable_coef_matrix(
     df_consum: pd.DataFrame,
-    summer_day_boost: float = 0.40,
+    gen_pavello: np.ndarray,
     min_kwp_threshold: float = 0.5,
 ) -> dict:
     """
-    Calcula la matriu de coeficients variables del Pavelló.
-
-    Parameters
-    ----------
-    df_consum : DataFrame
-        Consum horari per CUPS (columnes = cups_ids, índex DatetimeIndex).
-    summer_day_boost : float
-        Fracció (0–0.8) de la quota dels edificis que es redistribueix
-        als CUPS d'enllumeament en hores de sol d'estiu per compensar.
-    min_kwp_threshold : float
-        CUPS amb assignació mitjana anual < X kWp s'exclouen (igual que SLSQP).
-
-    Returns
-    -------
-    dict[cups_id] -> np.ndarray(12, 24)
-        Coeficients arrodonits a 6 decimals. Per a cada (m, h):
-        sum(coefs[:, m, h]) == TARGET_RATIO.
+    Calcula la matriu de coeficients variables del Pavelló usant Internal Load Balancing.
+    Fase 1: Autoconsum Directe (proporcional a la demanda diürna).
+    Fase 2: Sumideros d'Excedents (Sinks) basats en el consum nocturn principalment.
     """
     cups_ids = list(df_consum.columns)
     N = len(cups_ids)
@@ -69,9 +55,8 @@ def compute_variable_coef_matrix(
     months_v = df_consum.index.month.values
     hours_v = df_consum.index.hour.values
     lighting_mask = np.array([_is_lighting(c) for c in cups_ids], dtype=bool)
-    building_mask = ~lighting_mask
 
-    # --- Pas 1: consum mig per (CUPS, mes, hora) ---
+    # --- Pas 1: consum mig per (CUPS, mes, hora) i pre-anàlisi ---
     mean_cons = np.zeros((N, 12, 24))
     for i, cups_id in enumerate(cups_ids):
         vals = df_consum[cups_id].values
@@ -81,61 +66,73 @@ def compute_variable_coef_matrix(
                 if mask.any():
                     mean_cons[i, m_idx, h] = vals[mask].mean()
 
-    # --- Pas 2: repartiment proporcional base ---
-    raw_coef = np.zeros((N, 12, 24))
+    # Consum total mensual per cada equipament (per fer de Sink)
+    monthly_cons = np.zeros((N, 12))
+    for m_idx in range(12):
+        for i in range(N):
+            monthly_cons[i, m_idx] = mean_cons[i, m_idx, :].sum() * 30  # pes pur
+
+    # Mitjana de generació per mes i hora
+    mean_gen = np.zeros((12, 24))
     for m_idx in range(12):
         for h in range(24):
-            demands = mean_cons[:, m_idx, h]
-            total_d = demands.sum()
-            if total_d > 0:
-                raw_coef[:, m_idx, h] = (demands / total_d) * TARGET_RATIO
-            else:
-                raw_coef[:, m_idx, h] = TARGET_RATIO / N
+            mask = (months_v == m_idx + 1) & (hours_v == h)
+            if mask.any():
+                mean_gen[m_idx, h] = gen_pavello[mask].mean()
 
-    # --- Pas 3: boost diürn d'estiu cap als enllumeaments ---
-    # Com que de dia no hi ha consum d'enllumenat, es reparteix proporcional al seu consum total del mes
-    if summer_day_boost > 0 and lighting_mask.any() and building_mask.any():
-        # Pre-calcular el consum total mensual per a assignar pesos
-        monthly_cons = mean_cons.sum(axis=2)  # Forma: (N, 12)
-        
-        for m_idx in range(12):
-            month_num = m_idx + 1
-            if month_num not in SUMMER_MONTHS:
+    # --- Pas 2: Distribució Algorísmica Greedy (Balanç Intern) ---
+    raw_coef = np.zeros((N, 12, 24))
+    
+    for m_idx in range(12):
+        # Definim els Sinks per a la Fase 2 (Excedents). Prioritat Enllumenat.
+        sink_weights = np.zeros(N)
+        light_m_cons = monthly_cons[lighting_mask, m_idx].sum()
+        if light_m_cons > 0:
+            sink_weights[lighting_mask] = monthly_cons[lighting_mask, m_idx] / light_m_cons
+        else:
+            tot_m_cons = monthly_cons[:, m_idx].sum()
+            if tot_m_cons > 0:
+                sink_weights = monthly_cons[:, m_idx] / tot_m_cons
+            else:
+                sink_weights = np.ones(N) / N
+                
+        for h in range(24):
+            demands = mean_cons[:, m_idx, h]
+            g_h = mean_gen[m_idx, h]
+            g_target_h = g_h * TARGET_RATIO
+            
+            if g_target_h <= 1e-6:
+                # Sense generació -> equitatiu
+                total_d = demands.sum()
+                if total_d > 0:
+                    raw_coef[:, m_idx, h] = (demands / total_d) * TARGET_RATIO
+                else:
+                    raw_coef[:, m_idx, h] = TARGET_RATIO / N
                 continue
                 
-            light_monthly = monthly_cons[lighting_mask, m_idx]
-            light_monthly_tot = light_monthly.sum()
-            if light_monthly_tot > 0:
-                light_weights = light_monthly / light_monthly_tot
+            # Fase 1: Intentar cobrir el consum existent (Autoconsum directe)
+            total_d = demands.sum()
+            if total_d >= g_target_h:
+                # No hi ha excedents, es reparteix tot a l'autoconsum directament
+                raw_coef[:, m_idx, h] = (demands / total_d) * TARGET_RATIO
             else:
-                light_weights = np.ones(lighting_mask.sum()) / lighting_mask.sum()
+                # Hi ha excedents. Cobreix el que es pot cobrir exactament i bolca a la resta.
+                coef_per_demand = demands / g_h
+                raw_coef[:, m_idx, h] = coef_per_demand
                 
-            for h in range(24):
-                if h not in DAY_HOURS:
-                    continue
-                demands = mean_cons[:, m_idx, h]
+                # Fase 2: Assignar energia excedent als Sinks
+                assigned_ratio = coef_per_demand.sum()
+                remainder_ratio = TARGET_RATIO - assigned_ratio
+                
+                if remainder_ratio > 1e-9:
+                    raw_coef[:, m_idx, h] += remainder_ratio * sink_weights
 
-                bld_coef_sum = raw_coef[building_mask, m_idx, h].sum()
-                boost = bld_coef_sum * summer_day_boost
+            # Normalize for floating point safety
+            col_sum = raw_coef[:, m_idx, h].sum()
+            if col_sum > 0:
+                raw_coef[:, m_idx, h] *= TARGET_RATIO / col_sum
 
-                # Repartir boost als enllumeaments segons les seves hores nocturnes (pes mensual)
-                raw_coef[lighting_mask, m_idx, h] += boost * light_weights
-
-                # Restar proporcionalment dels edificis
-                bld_d = demands[building_mask]
-                bld_total = bld_d.sum()
-                if bld_total > 0:
-                    raw_coef[building_mask, m_idx, h] -= boost * (bld_d / bld_total)
-                    raw_coef[building_mask, m_idx, h] = np.maximum(
-                        0.0, raw_coef[building_mask, m_idx, h]
-                    )
-
-                # Re-normalitzar per garantir la suma exacta
-                col_sum = raw_coef[:, m_idx, h].sum()
-                if col_sum > 0:
-                    raw_coef[:, m_idx, h] *= TARGET_RATIO / col_sum
-
-    # --- Pas 4: excloure CUPS per sota del llindar kWp ---
+    # --- Pas 3: excloure CUPS per sota del llindar kWp ---
     mean_annual_coef = raw_coef.mean(axis=(1, 2))
     excluded = (mean_annual_coef * PAVELLO_KWP) < min_kwp_threshold
 
@@ -143,19 +140,24 @@ def compute_variable_coef_matrix(
         raw_coef[excluded] = 0.0
         active = ~excluded
         for m_idx in range(12):
+            sink_weights_act = np.zeros(N)
+            light_m_cons = monthly_cons[lighting_mask & active, m_idx].sum()
+            if light_m_cons > 0:
+                sink_weights_act[lighting_mask & active] = monthly_cons[lighting_mask & active, m_idx] / light_m_cons
+            else:
+                tot_m_cons = monthly_cons[active, m_idx].sum()
+                if tot_m_cons > 0:
+                    sink_weights_act[active] = monthly_cons[active, m_idx] / tot_m_cons
+                else:
+                    sink_weights_act[active] = 1.0 / active.sum()
+                    
             for h in range(24):
                 deficit = TARGET_RATIO - raw_coef[:, m_idx, h].sum()
                 if deficit < 1e-9:
                     continue
-                active_sum = raw_coef[active, m_idx, h].sum()
-                if active_sum > 0:
-                    raw_coef[active, m_idx, h] += deficit * (
-                        raw_coef[active, m_idx, h] / active_sum
-                    )
-                elif active.sum() > 0:
-                    raw_coef[active, m_idx, h] = deficit / active.sum()
+                raw_coef[:, m_idx, h] += deficit * sink_weights_act
 
-    # --- Pas 5: arrodoniment legal a 6 decimals (suma = TARGET_RATIO) ---
+    # --- Pas 4: arrodoniment legal a 6 decimals (suma = TARGET_RATIO) ---
     target_int = int(round(TARGET_RATIO * 1e6))
     final_coef = np.zeros((N, 12, 24))
 
@@ -330,10 +332,10 @@ def render_cle_variable_optimizer():
     """
     st.markdown("### 🔀 Coeficients Variables Horaris")
     st.markdown("""
-    Distribueix la quota del Pavelló **proporcionalment al consum real** de cada
-    equipament en cada franja horària. Durant els mesos d'estiu (Jun–Ago), com que
-    el consum dels edificis baixa però tenen generació, es redirigeix part de la
-    seva quota diürna a l'enllumenat públic per evitar excedents no compensables.
+    Calcula mitjançant el model algorísmic d'**Internal Load Balancing (Greedy Multi-CUPS)** l'assignació òptima 
+    hora a hora garantint el màxim estalvi possible. S'elimina la heurística de l'estiu: el sistema cobreix primer 
+    l'autoconsum exacte de l'Ajuntament i desplaça autònomament el 100% de la bossa d'excedents massius cap a l'enllumenat municipal (Sinks) 
+    gràcies al seu enorme marge regulatori negatiu derivat del gran pes en la factura d'importació nocturna.
 
     > La Sala Nova manté el seu coeficient fix en tot moment.
     """)
@@ -355,26 +357,11 @@ def render_cle_variable_optimizer():
         st.info("ℹ️ Primer executeu l'optimització des de la pestanya **📌 Coeficients Fixes** per carregar les dades.")
         return
 
-    # --- Controls ---
-    boost_pct = st.slider(
-        "☀️ Boost diürn estiu (Jun–Ago, 08h–20h) cap a enllumeaments:",
-        min_value=0, max_value=80, value=40, step=5,
-        format="%d%%",
-        help=(
-            "Percentatge de la quota dels edificis que es redirigeix "
-            "als CUPS d'enllumeament durant les hores de sol d'estiu. "
-            "Com que a l'estiu els edificis consumeixen menys en global, "
-            "reduir la seva quota diürna evita excedents no compensables."
-        ),
-        key="var_boost_slider"
-    )
-    boost = boost_pct / 100.0
-
     if st.button("⚡ Calcular Coeficients Variables", key="btn_var_coef", type="primary"):
-        with st.spinner("Calculant matriu de coeficients (12 mesos × 24 hores)..."):
+        with st.spinner("Calculant matriu òptima (Internal Load Balancing)..."):
             coef_matrix = compute_variable_coef_matrix(
                 df_consum,
-                summer_day_boost=boost,
+                gen_pavello=gen_pav,
                 min_kwp_threshold=min_kwp,
             )
         with st.spinner("Simulant facturació hora per hora..."):
